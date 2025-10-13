@@ -1,0 +1,5 @@
+.idea
+models/*
+data/*
+videos/output/*
+videos/input/*
