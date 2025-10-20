@@ -3,3 +3,7 @@ models/*
 data/*
 videos/output/*
 videos/input/*
+*.pt
+runs
+*.mp4
+*.yaml
