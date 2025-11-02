@@ -21,7 +21,7 @@ APPROX_EPSILON = 0.001   # Sınırları ne kadar düzleştireceğimizi belirler.
 # --- AYARLAR ---
 VIDEO_INPUT_PATH = "./videos/input/court.mp4"
 VIDEO_OUTPUT_PATH = "./videos/output/output_video_stabilized.mp4"
-MODEL_PATH = "./models/best_model (1).pth"
+MODEL_PATH = "./models/seg/best_model (1).pth"
 
 IMAGE_HEIGHT = 640
 IMAGE_WIDTH = 640
