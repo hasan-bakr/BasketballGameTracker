@@ -5,9 +5,9 @@ import time
 # -------------------------------
 # 1️⃣ MODELİ YÜKLE
 # -------------------------------
-model_path = r'C:\Users\524ha\Desktop\Resources\BasketballGameTracker\models\yolo\best_seg.pt'
+model_path = r'C:\Users\524ha\Desktop\Resources\BasketballGameTracker\models\yolo\player_seg.pt'
 model = YOLO(model_path)
-
+#model = YOLO("yolo11s-seg.pt")  
 # -------------------------------
 # 2️⃣ VİDEOYU YÜKLE
 # -------------------------------
