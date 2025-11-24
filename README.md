@@ -19,7 +19,7 @@ Projenin şu anki en güçlü yeteneklerinden biri, oyun alanını videodan ayr�
 
 
 ![Saha Segmentasyonu Demo](CourtSegmentation.gif)
-*(Yukarıdaki alana segmentasyon videonuzun GIF halini ekleyerek görselleştirmeyi güçlendirebilirsiniz.)*
+
 
 ## ✨ Özellikler (Mevcut ve Planlanan)
 
