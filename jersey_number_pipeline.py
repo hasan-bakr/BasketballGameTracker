@@ -34,7 +34,7 @@ from pathlib import Path
 # ============================================
 class Config:
     # Model paths
-    POSE_MODEL_PATH = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\yolo11m-pose.pt"
+    POSE_MODEL_PATH = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\yolo26m-pose.pt"
     
     # OCR model
     PARSEQ_MODEL = "parseq_tiny"  # PARSeq Tiny: Scene Text Recognition (hızlı)
@@ -133,28 +133,6 @@ class JerseyNumberDetector:
             'skipped_referee': 0,
             'processed': 0
         }
-        
-    def _load_parseq(self):
-        """PARSeq Tiny modelini yükle (torch.hub ile)"""
-        try:
-            from torchvision import transforms
-            
-            # PARSeq tiny modeli (hızlı)
-            model = torch.hub.load('baudm/parseq', 'parseq_tiny', pretrained=True)
-            model = model.to(self.device)
-            model.eval()
-            
-            # Transform pipeline - PARSeq 32x128 boyutunda tensor bekliyor
-            self.parseq_transform = transforms.Compose([
-                transforms.Resize((32, 128)),
-                transforms.ToTensor(),
-                transforms.Normalize(0.5, 0.5)
-            ])
-            
-            return model
-        except Exception as e:
-            print(f"⚠️ PARSeq yüklenemedi: {e}")
-            return None
     
     def is_back_view(self, keypoints, min_conf=None):
         """
