@@ -124,6 +124,44 @@ class PoseDetector:
         )
         return results
     
+    # Skeleton bağlantıları (COCO format)
+    SKELETON = [
+        (0, 1), (0, 2), (1, 3), (2, 4),  # Yüz
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Kollar
+        (5, 11), (6, 12), (11, 12),  # Gövde
+        (11, 13), (13, 15), (12, 14), (14, 16)  # Bacaklar
+    ]
+    
+    def draw_skeleton(self, frame, keypoints, color=(0, 255, 255), thickness=2):
+        """
+        Pose iskeletini çiz.
+        
+        Args:
+            frame: BGR görüntü
+            keypoints: [17, 3] keypoint array
+            color: Çizgi rengi
+            thickness: Çizgi kalınlığı
+        """
+        # Debug modunda çok düşük threshold - eksik parçaları da göster
+        min_conf = 0.05
+        
+        # Noktaları çiz
+        for i, (x, y, conf) in enumerate(keypoints):
+            if conf > min_conf:
+                # Güven rengini ayarla (düşük=kırmızı, yüksek=yeşil)
+                point_color = (0, int(255 * conf), int(255 * (1 - conf)))
+                cv2.circle(frame, (int(x), int(y)), 4, point_color, -1)
+        
+        # Bağlantıları çiz
+        for (i, j) in self.SKELETON:
+            if keypoints[i][2] > min_conf and keypoints[j][2] > min_conf:
+                pt1 = (int(keypoints[i][0]), int(keypoints[i][1]))
+                pt2 = (int(keypoints[j][0]), int(keypoints[j][1]))
+                # Ortalama güven üzerinden renk
+                avg_conf = (keypoints[i][2] + keypoints[j][2]) / 2
+                line_color = (0, int(255 * avg_conf), int(255 * (1 - avg_conf)))
+                cv2.line(frame, pt1, pt2, line_color, thickness)
+    
     def is_back_view(self, keypoints, min_conf=None) -> tuple:
         """
         Oyuncunun arkadan görünüp görünmediğini kontrol et.

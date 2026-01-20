@@ -13,18 +13,23 @@ class PlayerTracker:
     
     Bir oyuncuya numara atamadan önce aynı numaranın 
     birden fazla kez tespit edilmesi gerekir.
+    
+    Kameradan çıkan oyuncular belirli frame sonra unutulur.
     """
     
-    def __init__(self, confirmation_count: int = 3, min_confidence: float = 0.7):
+    def __init__(self, confirmation_count: int = 3, min_confidence: float = 0.7, 
+                 timeout_frames: int = 30):
         """
         PlayerTracker'ı başlat.
         
         Args:
             confirmation_count: Onay için gereken tespit sayısı
             min_confidence: Minimum OCR confidence
+            timeout_frames: Oyuncu unutulma süresi (frame)
         """
         self.confirmation_count = confirmation_count
         self.min_confidence = min_confidence
+        self.timeout_frames = timeout_frames
         
         # Onaylanmış oyuncular: {track_id: jersey_number}
         self.confirmed_players = {}
@@ -32,12 +37,47 @@ class PlayerTracker:
         # Detection history: {track_id: [(number, confidence), ...]}
         self.detection_history = defaultdict(list)
         
+        # Son görülme frame'i: {track_id: frame_num}
+        self.last_seen = {}
+        
         # Stats
         self.stats = {
             'confirmed': 0,
             'ocr_skipped': 0,
-            'ocr_performed': 0
+            'ocr_performed': 0,
+            'forgotten': 0
         }
+    
+    def update_seen(self, track_id: int, frame_num: int):
+        """Oyuncunun görüldüğünü kaydet."""
+        self.last_seen[track_id] = frame_num
+    
+    def cleanup_old_tracks(self, current_frame: int):
+        """
+        Uzun süredir görülmeyen track_id'leri temizle.
+        
+        Args:
+            current_frame: Şu anki frame numarası
+        """
+        to_remove = []
+        
+        for track_id, last_frame in self.last_seen.items():
+            if current_frame - last_frame > self.timeout_frames:
+                to_remove.append(track_id)
+        
+        for track_id in to_remove:
+            # Onaylı oyuncuları unut
+            if track_id in self.confirmed_players:
+                del self.confirmed_players[track_id]
+            
+            # Detection history'yi temizle
+            if track_id in self.detection_history:
+                del self.detection_history[track_id]
+            
+            # Last seen'den kaldır
+            del self.last_seen[track_id]
+            
+            self.stats['forgotten'] += 1
     
     def is_confirmed(self, track_id: int) -> bool:
         """Oyuncu onaylı mı kontrol et."""
@@ -47,7 +87,8 @@ class PlayerTracker:
         """Onaylı oyuncunun jersey numarasını döndür."""
         return self.confirmed_players.get(track_id)
     
-    def add_detection(self, track_id: int, number: str, confidence: float) -> bool:
+    def add_detection(self, track_id: int, number: str, confidence: float, 
+                      frame_num: int = 0) -> bool:
         """
         Yeni tespit ekle ve onay kontrolü yap.
         
@@ -55,10 +96,14 @@ class PlayerTracker:
             track_id: Oyuncu track ID
             number: Tespit edilen numara
             confidence: OCR confidence
+            frame_num: Frame numarası
             
         Returns:
             newly_confirmed: Bu tespit ile onaylandı mı
         """
+        # Görüldüğünü kaydet
+        self.update_seen(track_id, frame_num)
+        
         # Zaten onaylı ise atla
         if self.is_confirmed(track_id):
             return False
@@ -120,30 +165,33 @@ class PlayerTracker:
         """Tüm verileri sıfırla."""
         self.confirmed_players.clear()
         self.detection_history.clear()
-        self.stats = {'confirmed': 0, 'ocr_skipped': 0, 'ocr_performed': 0}
+        self.last_seen.clear()
+        self.stats = {'confirmed': 0, 'ocr_skipped': 0, 'ocr_performed': 0, 'forgotten': 0}
     
     def get_summary(self) -> dict:
         """Özet istatistikler döndür."""
         return {
             'confirmed_players': len(self.confirmed_players),
             'jersey_numbers': list(self.confirmed_players.values()),
+            'active_tracks': len(self.last_seen),
             'stats': self.stats.copy()
         }
 
 
 # Test kodu
 if __name__ == "__main__":
-    tracker = PlayerTracker(confirmation_count=3)
+    tracker = PlayerTracker(confirmation_count=3, timeout_frames=10)
     
     # Simüle et
-    tracker.add_detection(1, "23", 0.95)
-    tracker.add_detection(1, "23", 0.92)
-    tracker.add_detection(1, "23", 0.88)  # 3. tespit -> onaylanmalı
+    tracker.add_detection(1, "23", 0.95, frame_num=1)
+    tracker.add_detection(1, "23", 0.92, frame_num=2)
+    tracker.add_detection(1, "23", 0.88, frame_num=3)  # Onaylandı
     
-    tracker.add_detection(2, "10", 0.90)
-    tracker.add_detection(2, "10", 0.85)
-    # Oyuncu 2 henüz onaylı değil
+    print(f"Frame 3 - Oyuncu 1 onaylı: {tracker.is_confirmed(1)}")
     
-    print(f"\nOyuncu 1 onaylı: {tracker.is_confirmed(1)} -> #{tracker.get_jersey(1)}")
-    print(f"Oyuncu 2 onaylı: {tracker.is_confirmed(2)}")
+    # 15 frame sonra cleanup
+    tracker.cleanup_old_tracks(current_frame=18)
+    print(f"Frame 18 - Oyuncu 1 onaylı: {tracker.is_confirmed(1)}")  # Unutuldu
+    
     print(f"\nÖzet: {tracker.get_summary()}")
+

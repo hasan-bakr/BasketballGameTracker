@@ -1,10 +1,14 @@
+**/__pycache__/
+*.pyc
 .idea
 models/*
 data/*
 videos/output/*
 videos/input/*
 *.pt
+*.pth
 runs
 *.mp4
 *.yaml
 *.jpg
+*.onnx
