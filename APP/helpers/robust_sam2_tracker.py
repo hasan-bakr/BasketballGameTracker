@@ -38,13 +38,14 @@ class RobustSAM2Tracker:
     
     def __init__(
         self,
-        sam2_config: str = "configs/sam2.1/sam2.1_hiera_b+.yaml",  # SAM2.1 base+ (better quality)
-        sam2_checkpoint: str = "models/sam2.1_hiera_base_plus.pt",
+        sam2_config: str = "configs/sam2.1/sam2.1_hiera_t.yaml",  # SAM2.1 tiny (faster)
+        sam2_checkpoint: str = "models/sam2.1_hiera_tiny.pt",
         yolo_path: str = "models/yolo/best_detection.pt",
         device: str = "cuda",
         confidence_threshold: float = 0.5,
         iou_threshold: float = 0.3,
-        redetect_interval: int = 30
+        redetect_interval: int = 30,
+        use_amp: bool = True  # Enable Automatic Mixed Precision for ~2x speedup
     ):
         print("📦 Loading Robust SAM2 Tracker...")
         
@@ -52,6 +53,10 @@ class RobustSAM2Tracker:
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.redetect_interval = redetect_interval
+        self.use_amp = use_amp
+        
+        if use_amp:
+            print("⚡ AMP (FP16) enabled for ~2x speedup")
         
         # Load models
         self.yolo = YoloDetector(model_path=yolo_path, device="cpu")
@@ -243,8 +248,9 @@ class RobustSAM2Tracker:
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
             
-            # SAM2 state başlat
-            inference_state = self.predictor.init_state(video_path=temp_dir)
+            # SAM2 state başlat (AMP ile)
+            with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16):
+                inference_state = self.predictor.init_state(video_path=temp_dir)
             
             # İlk batch: YOLO ile tespit
             if frame_idx == 0:
@@ -253,8 +259,9 @@ class RobustSAM2Tracker:
                 # Devam eden takip: Önceki maskeleri prompt olarak kullan
                 self._continue_tracking(inference_state, temp_dir)
             
-            # Propagate ve sonuçları topla
-            batch_masks = self._propagate_batch(inference_state, frames, temp_dir)
+            # Propagate ve sonuçları topla (AMP ile)
+            with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16):
+                batch_masks = self._propagate_batch(inference_state, frames, temp_dir)
             
             # Her frame için çiz ve kaydet
             for i, frame in enumerate(frames):
@@ -654,4 +661,4 @@ if __name__ == "__main__":
         iou_threshold=0.3,
         redetect_interval=30
     )
-    tracker.process_video(video_in, video_out, max_frames=400)
+    tracker.process_video(video_in, video_out, max_frames=200)
