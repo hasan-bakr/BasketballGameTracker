@@ -1,11 +1,13 @@
 """
-SAM2 Robust Video Tracker with IoU Re-ID
-=========================================
+SAM2 Robust Video Tracker with IoU Re-ID + Court Analysis
+==========================================================
 Özellikler:
 - SAM2 Video Propagation (Memory Bank ile)
 - IoU tabanlı Re-identification (kayıp nesneleri kurtarma)
 - Güven skoru takibi
 - Maske görselleştirme + ID gösterimi
+- Court Keypoint Detection + Homography
+- Tactical View (bird's eye) + Video kayıt
 """
 
 import os
@@ -18,14 +20,176 @@ import sys
 from typing import Dict, List, Tuple, Optional
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
+from ultralytics import YOLO
 
 # SAM2 Video imports
 from sam2.build_sam import build_sam2_video_predictor
 
 # Project imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(ROOT_DIR)
 from APP.helpers.yolo_detector import YoloDetector
 from APP.helpers.jersey_detector import JerseyDetector, JerseyReIDBank
+
+# ═══════════════════════════════════════════════════════════════════════
+# Court Keypoint Constants
+# ═══════════════════════════════════════════════════════════════════════
+
+TACTICAL_WIDTH = 300
+TACTICAL_HEIGHT = 161
+ACTUAL_WIDTH_M = 28.0
+ACTUAL_HEIGHT_M = 15.0
+
+TACTICAL_KEYPOINTS = [
+    (0, 0),
+    (0, int((0.91 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (0, int((5.18 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (0, int((10.0 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (0, int((14.1 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (0, int(TACTICAL_HEIGHT)),
+    (int(TACTICAL_WIDTH / 2), TACTICAL_HEIGHT),
+    (int(TACTICAL_WIDTH / 2), 0),
+    (int((5.79 / ACTUAL_WIDTH_M) * TACTICAL_WIDTH), int((5.18 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (int((5.79 / ACTUAL_WIDTH_M) * TACTICAL_WIDTH), int((10.0 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (TACTICAL_WIDTH, int(TACTICAL_HEIGHT)),
+    (TACTICAL_WIDTH, int((14.1 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (TACTICAL_WIDTH, int((10.0 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (TACTICAL_WIDTH, int((5.18 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (TACTICAL_WIDTH, int((0.91 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (TACTICAL_WIDTH, 0),
+    (int(((ACTUAL_WIDTH_M - 5.79) / ACTUAL_WIDTH_M) * TACTICAL_WIDTH), int((5.18 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+    (int(((ACTUAL_WIDTH_M - 5.79) / ACTUAL_WIDTH_M) * TACTICAL_WIDTH), int((10.0 / ACTUAL_HEIGHT_M) * TACTICAL_HEIGHT)),
+]
+
+KP_COLORS = [
+    (0, 255, 0), (0, 200, 0), (0, 150, 0), (0, 100, 0), (0, 200, 0), (0, 255, 0),
+    (255, 255, 0), (255, 255, 0),
+    (0, 0, 255), (0, 0, 255),
+    (255, 0, 0), (255, 50, 0), (255, 100, 0), (255, 150, 0), (255, 50, 0), (255, 0, 0),
+    (0, 165, 255), (0, 165, 255),
+]
+
+KP_NAMES = [
+    "L-TL", "L-BL1", "L-BL2", "L-BL3", "L-BL4", "L-BotL",
+    "Mid-Bot", "Mid-Top",
+    "FT-L1", "FT-L2",
+    "R-BotR", "R-BR4", "R-BR3", "R-BR2", "R-BR1", "R-TR",
+    "FT-R1", "FT-R2",
+]
+
+DEFAULT_KEYPOINT_MODEL = os.path.join(ROOT_DIR, "models", "keypoints", "test_keypoint.pt")
+DEFAULT_COURT_IMAGE = os.path.join(ROOT_DIR, "basketball_analysis", "images", "basketball_court.png")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Court Helper Functions
+# ═══════════════════════════════════════════════════════════════════════
+
+def measure_distance(p1, p2):
+    return np.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+def validate_keypoints(keypoints_xy):
+    """Keypoint'leri orantısal uzaklık kontrolü ile doğrula."""
+    kp = keypoints_xy.copy()
+    detected_indices = [i for i in range(len(kp)) if kp[i][0] > 0 and kp[i][1] > 0]
+    if len(detected_indices) < 3:
+        return kp
+    invalid = []
+    for i in detected_indices:
+        if kp[i][0] == 0 and kp[i][1] == 0:
+            continue
+        other_indices = [idx for idx in detected_indices if idx != i and idx not in invalid]
+        if len(other_indices) < 2:
+            continue
+        j, k = other_indices[0], other_indices[1]
+        d_ij = measure_distance(kp[i], kp[j])
+        d_ik = measure_distance(kp[i], kp[k])
+        t_ij = measure_distance(TACTICAL_KEYPOINTS[i], TACTICAL_KEYPOINTS[j])
+        t_ik = measure_distance(TACTICAL_KEYPOINTS[i], TACTICAL_KEYPOINTS[k])
+        if t_ij > 0 and t_ik > 0:
+            prop_detected = d_ij / d_ik if d_ik > 0 else float('inf')
+            prop_tactical = t_ij / t_ik if t_ik > 0 else float('inf')
+            error = abs((prop_detected - prop_tactical) / prop_tactical)
+            if error > 0.8:
+                kp[i] = [0.0, 0.0]
+                invalid.append(i)
+    return kp
+
+
+def compute_homography(keypoints_xy):
+    """Tespit edilen keypoint'lerden homography matrisi hesapla."""
+    valid_indices = [i for i in range(len(keypoints_xy))
+                     if keypoints_xy[i][0] > 0 and keypoints_xy[i][1] > 0]
+    if len(valid_indices) < 4:
+        return None
+    src = np.array([keypoints_xy[i] for i in valid_indices], dtype=np.float32)
+    dst = np.array([TACTICAL_KEYPOINTS[i] for i in valid_indices], dtype=np.float32)
+    try:
+        H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        return H
+    except cv2.error:
+        return None
+
+
+def draw_keypoints_on_frame(frame, keypoints_xy, confidence=None):
+    """Tespit edilen keypoint'leri frame üzerine çiz."""
+    for i in range(len(keypoints_xy)):
+        x, y = int(keypoints_xy[i][0]), int(keypoints_xy[i][1])
+        if x <= 0 and y <= 0:
+            continue
+        color = KP_COLORS[i] if i < len(KP_COLORS) else (0, 255, 0)
+        name = KP_NAMES[i] if i < len(KP_NAMES) else str(i)
+        cv2.circle(frame, (x, y), 8, color, -1)
+        cv2.circle(frame, (x, y), 10, (255, 255, 255), 2)
+        if confidence is not None and i < len(confidence):
+            label = f"{name} ({confidence[i]:.2f})"
+        else:
+            label = name
+        cv2.putText(frame, label, (x + 12, y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    return frame
+
+
+def draw_tactical_view(court_img, keypoints_xy, H, player_feet=None, player_jerseys=None):
+    """Tactical view oluştur: saha imgesi + keypoint'ler + oyuncu pozisyonları."""
+    tactical = court_img.copy()
+    SNAP_THRESHOLD = 60
+    if H is not None:
+        valid_indices = [i for i in range(len(keypoints_xy))
+                         if keypoints_xy[i][0] > 0 and keypoints_xy[i][1] > 0]
+        for i in valid_indices:
+            src_pt = np.array([[keypoints_xy[i]]], dtype=np.float32)
+            dst_pt = cv2.perspectiveTransform(src_pt, H)
+            tx, ty = dst_pt[0][0][0], dst_pt[0][0][1]
+            expected_x, expected_y = TACTICAL_KEYPOINTS[i]
+            tact_dist = np.sqrt((tx - expected_x) ** 2 + (ty - expected_y) ** 2)
+            if tact_dist <= SNAP_THRESHOLD:
+                tx, ty = int(expected_x), int(expected_y)
+            else:
+                tx, ty = int(tx), int(ty)
+            if 0 <= tx <= TACTICAL_WIDTH and 0 <= ty <= TACTICAL_HEIGHT:
+                draw_x = min(tx, TACTICAL_WIDTH - 1)
+                draw_y = min(ty, TACTICAL_HEIGHT - 1)
+                color = KP_COLORS[i] if i < len(KP_COLORS) else (0, 255, 0)
+                cv2.circle(tactical, (draw_x, draw_y), 5, color, -1)
+                cv2.circle(tactical, (draw_x, draw_y), 6, (255, 255, 255), 1)
+        if player_feet is not None and len(player_feet) > 0:
+            for idx, foot_pt in enumerate(player_feet):
+                src_pt = np.array([[foot_pt]], dtype=np.float32)
+                try:
+                    dst_pt = cv2.perspectiveTransform(src_pt, H)
+                    px, py = int(dst_pt[0][0][0]), int(dst_pt[0][0][1])
+                    if 0 <= px < TACTICAL_WIDTH and 0 <= py < TACTICAL_HEIGHT:
+                        cv2.circle(tactical, (px, py), 6, (255, 255, 255), -1)
+                        cv2.circle(tactical, (px, py), 7, (0, 0, 0), 2)
+                        if player_jerseys and idx < len(player_jerseys) and player_jerseys[idx]:
+                            cv2.putText(tactical, player_jerseys[idx],
+                                        (px + 8, py + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.35, (255, 255, 255), 1)
+                except:
+                    pass
+    return tactical
 
 
 class RobustSAM2Tracker:
@@ -45,7 +209,9 @@ class RobustSAM2Tracker:
         confidence_threshold: float = 0.5,
         iou_threshold: float = 0.3,
         redetect_interval: int = 30,
-        use_amp: bool = True  # Enable Automatic Mixed Precision for ~2x speedup
+        use_amp: bool = True,  # Enable Automatic Mixed Precision for ~2x speedup
+        keypoint_model_path: str = None,
+        court_image_path: str = None
     ):
         print("📦 Loading Robust SAM2 Tracker...")
         
@@ -65,6 +231,31 @@ class RobustSAM2Tracker:
         # Jersey detector for Re-ID
         self.jersey_detector = JerseyDetector(device=device)
         self.jersey_bank = JerseyReIDBank()
+        
+        # Court Keypoint model
+        kp_path = keypoint_model_path or DEFAULT_KEYPOINT_MODEL
+        self.kp_model = None
+        if os.path.exists(kp_path):
+            print(f"📦 Loading Keypoint model: {kp_path}")
+            self.kp_model = YOLO(kp_path)
+            print("✅ Keypoint model loaded!")
+        else:
+            print(f"⚠️ Keypoint model not found: {kp_path}")
+        
+        # Court image for tactical view
+        court_path = court_image_path or DEFAULT_COURT_IMAGE
+        if os.path.exists(court_path):
+            self.court_img = cv2.imread(court_path)
+            self.court_img = cv2.resize(self.court_img, (TACTICAL_WIDTH, TACTICAL_HEIGHT))
+        else:
+            self.court_img = np.ones((TACTICAL_HEIGHT, TACTICAL_WIDTH, 3), dtype=np.uint8) * 40
+            cv2.rectangle(self.court_img, (0, 0), (TACTICAL_WIDTH - 1, TACTICAL_HEIGHT - 1), (255, 255, 255), 1)
+            cv2.line(self.court_img, (TACTICAL_WIDTH // 2, 0), (TACTICAL_WIDTH // 2, TACTICAL_HEIGHT), (255, 255, 255), 1)
+        
+        # Keypoint smoothing state
+        self.last_good_keypoints = None
+        self.last_H = None
+        self.homography_success_count = 0
         
         # Tracking state
         self.tracked_objects: Dict[int, dict] = {}  # {obj_id: {"mask": ..., "confidence": ..., "color": ...}}
@@ -204,6 +395,112 @@ class RobustSAM2Tracker:
     # Video İşleme
     # ═══════════════════════════════════════════════════════════════════════
     
+    def _detect_keypoints(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        """Court keypoint detection + smoothing + homography."""
+        if self.kp_model is None:
+            return np.zeros((18, 2), dtype=np.float32), np.zeros(18, dtype=np.float32), self.last_H
+
+        results = self.kp_model.predict(frame, conf=0.5, verbose=False)
+        keypoints_xy = np.zeros((18, 2), dtype=np.float32)
+        confidences = np.zeros(18, dtype=np.float32)
+
+        if results and results[0].keypoints is not None:
+            kp_data = results[0].keypoints
+            if kp_data.xy is not None and len(kp_data.xy) > 0:
+                xy = kp_data.xy[0].cpu().numpy()
+                if len(xy) <= 18:
+                    keypoints_xy[:len(xy)] = xy
+                else:
+                    keypoints_xy = xy[:18]
+                if kp_data.conf is not None and len(kp_data.conf) > 0:
+                    conf = kp_data.conf[0].cpu().numpy()
+                    n = min(len(conf), 18)
+                    confidences[:n] = conf[:n]
+
+        # Camera transition detection
+        SMOOTH_ALPHA = 0.6
+        JUMP_THRESHOLD = 150
+        is_camera_transition = False
+        if self.last_good_keypoints is not None:
+            jump_count = 0
+            valid_count = 0
+            for i in range(18):
+                if keypoints_xy[i][0] > 0 and keypoints_xy[i][1] > 0:
+                    if self.last_good_keypoints[i][0] > 0 and self.last_good_keypoints[i][1] > 0:
+                        valid_count += 1
+                        dist = np.sqrt((keypoints_xy[i][0] - self.last_good_keypoints[i][0]) ** 2 +
+                                       (keypoints_xy[i][1] - self.last_good_keypoints[i][1]) ** 2)
+                        if dist > JUMP_THRESHOLD:
+                            jump_count += 1
+            is_camera_transition = (valid_count > 0 and jump_count / valid_count > 0.5)
+
+        if is_camera_transition:
+            self.last_good_keypoints = None
+
+        # Pre-homography from high-confidence keypoints
+        high_conf_kp = np.zeros((18, 2), dtype=np.float32)
+        high_conf_count = 0
+        for i in range(18):
+            if keypoints_xy[i][0] > 0 and keypoints_xy[i][1] > 0 and confidences[i] >= 0.5:
+                high_conf_kp[i] = keypoints_xy[i]
+                high_conf_count += 1
+        pre_H = compute_homography(high_conf_kp) if high_conf_count >= 4 else None
+
+        # Validate each keypoint against pre-homography
+        for i in range(18):
+            if keypoints_xy[i][0] <= 0 or keypoints_xy[i][1] <= 0:
+                continue
+            if pre_H is not None:
+                src_pt = np.array([[keypoints_xy[i]]], dtype=np.float32)
+                dst_pt = cv2.perspectiveTransform(src_pt, pre_H)
+                tx, ty = dst_pt[0][0][0], dst_pt[0][0][1]
+                expected_x, expected_y = TACTICAL_KEYPOINTS[i]
+                tact_dist = np.sqrt((tx - expected_x) ** 2 + (ty - expected_y) ** 2)
+                if tact_dist > 50:
+                    keypoints_xy[i] = [0.0, 0.0]
+                    continue
+
+        # Temporal smoothing
+        if self.last_good_keypoints is not None:
+            for i in range(18):
+                has_det = keypoints_xy[i][0] > 0 and keypoints_xy[i][1] > 0
+                has_hist = self.last_good_keypoints[i][0] > 0 and self.last_good_keypoints[i][1] > 0
+                if has_det and has_hist:
+                    keypoints_xy[i] = (SMOOTH_ALPHA * keypoints_xy[i] +
+                                       (1 - SMOOTH_ALPHA) * self.last_good_keypoints[i])
+                elif not has_det and has_hist:
+                    keypoints_xy[i] = self.last_good_keypoints[i].copy()
+
+        self.last_good_keypoints = keypoints_xy.copy()
+
+        # Compute homography
+        H = compute_homography(keypoints_xy)
+        if H is not None:
+            self.homography_success_count += 1
+            self.last_H = H
+        else:
+            H = self.last_H
+
+        return keypoints_xy, confidences, H
+
+    def _masks_to_feet(self, masks: Dict[int, np.ndarray]) -> Tuple[List[List[float]], List[Optional[str]]]:
+        """Maskelerden ayak pozisyonları (bbox alt-orta) ve jersey numaraları çıkar."""
+        feet = []
+        jerseys = []
+        for obj_id, mask in masks.items():
+            if mask.shape[:2] != self.frame_size:
+                mask = cv2.resize(mask.astype(np.float32), (self.frame_size[1], self.frame_size[0])) > 0.5
+            ys, xs = np.where(mask)
+            if len(xs) > 0:
+                cx = float(xs.mean())
+                foot_y = float(ys.max())  # Mask en alt noktası
+                feet.append([cx, foot_y])
+            else:
+                feet.append([0, 0])
+            jersey = self.jersey_bank.get_jersey(obj_id)
+            jerseys.append(jersey)
+        return feet, jerseys
+
     def process_video(
         self,
         video_path: str,
@@ -211,7 +508,7 @@ class RobustSAM2Tracker:
         max_frames: int = 300,
         batch_size: int = 50
     ):
-        """Video işle ve çıktı kaydet."""
+        """Video işle ve çıktı kaydet (+ tactical view video)."""
         print(f"\n🎬 Processing: {video_path}")
         
         cap = cv2.VideoCapture(video_path)
@@ -227,9 +524,18 @@ class RobustSAM2Tracker:
         
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         
-        # Video writer (boyutu sonra ayarlanacak)
+        # Video writers
         writer = None
+        tactical_writer = None
         temp_dir = "temp_robust_frames"
+        
+        # Tactical video path
+        base, ext = os.path.splitext(output_path)
+        tactical_output_path = f"{base}_tactical{ext}"
+        
+        # Tactical display size
+        tactical_display_w = 600
+        tactical_display_h = int(TACTICAL_HEIGHT * (tactical_display_w / TACTICAL_WIDTH))
         
         frame_idx = 0
         
@@ -247,6 +553,10 @@ class RobustSAM2Tracker:
                 h, w = frames[0].shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+                tactical_writer = cv2.VideoWriter(
+                    tactical_output_path, fourcc, fps,
+                    (tactical_display_w, tactical_display_h)
+                )
             
             # SAM2 state başlat (AMP ile)
             with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16):
@@ -266,29 +576,67 @@ class RobustSAM2Tracker:
             # Her frame için çiz ve kaydet
             for i, frame in enumerate(frames):
                 local_idx = i
-                if local_idx in batch_masks:
-                    masks = batch_masks[local_idx]
-                    
-                    # Her 5 frame'de bir jersey tespiti yap (performans için)
-                    if (frame_idx + i) % 5 == 0:
-                        self._detect_jerseys(frame, masks)
-                    
-                    result = self.draw_masks_with_ids(frame, masks)
-                else:
-                    result = frame
+                masks = batch_masks.get(local_idx, {})
                 
+                # Jersey tespiti (her 5 frame'de bir)
+                if masks and (frame_idx + i) % 5 == 0:
+                    self._detect_jerseys(frame, masks)
+                
+                # SAM2 masks çiz
+                result = self.draw_masks_with_ids(frame, masks) if masks else frame.copy()
+                
+                # Court keypoint detection + homography
+                keypoints_xy, confidences, H = self._detect_keypoints(frame)
+                n_detected = sum(1 for k in range(18) if keypoints_xy[k][0] > 0 and keypoints_xy[k][1] > 0)
+                
+                # Keypoint'leri frame'e çiz
+                result = draw_keypoints_on_frame(result, keypoints_xy, confidences)
+                
+                # Ayak pozisyonları ve jersey'ler
+                player_feet, player_jerseys = self._masks_to_feet(masks)
+                
+                # Status overlay
                 cv2.putText(result, f"Frame: {frame_idx + i}", (20, 40),
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(result, f"Objects: {len(self.tracked_objects)}", (20, 80),
+                cv2.putText(result, f"Objects: {len(self.tracked_objects)} | KP: {n_detected}/18", (20, 80),
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                
-                # Jersey bank durumunu da göster
+                status_color = (0, 255, 0) if H is not None else (0, 0, 255)
+                cv2.putText(result, f"Homography: {'OK' if H is not None else 'FAIL'}", (20, 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
                 jersey_count = len(self.jersey_bank.obj_to_jersey)
-                cv2.putText(result, f"Jerseys: {jersey_count}", (20, 120),
+                cv2.putText(result, f"Jerseys: {jersey_count}", (20, 160),
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                
                 writer.write(result)
+                
+                # Tactical view
+                tactical = draw_tactical_view(self.court_img, keypoints_xy, H,
+                                             player_feet, player_jerseys)
+                tactical_display = cv2.resize(tactical, (tactical_display_w, tactical_display_h))
+                tactical_writer.write(tactical_display)
+                
+                # Ekranda göster
+                try:
+                    max_display_w = 1280
+                    display = result
+                    if result.shape[1] > max_display_w:
+                        scale = max_display_w / result.shape[1]
+                        display = cv2.resize(result, (max_display_w, int(result.shape[0] * scale)))
+                    cv2.imshow("SAM2 Tracker", display)
+                    cv2.imshow("Tactical View", tactical_display)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        print("🛑 Kullanıcı tarafından durduruldu.")
+                        cap.release()
+                        writer.release()
+                        tactical_writer.release()
+                        if os.path.exists(temp_dir):
+                            shutil.rmtree(temp_dir)
+                        cv2.destroyAllWindows()
+                        return
+                except cv2.error:
+                    pass
             
-            # Periyodik YOLO re-detection - Yeni oyuncuları tespit et (jersey ile Re-ID)
+            # Periyodik YOLO re-detection
             if (frame_idx + batch_size) % self.redetect_interval < batch_size:
                 print("🔍 Smart re-detection...")
                 self._smart_redetection(frames[-1], batch_masks.get(len(frames)-1, {}))
@@ -302,13 +650,21 @@ class RobustSAM2Tracker:
         cap.release()
         if writer:
             writer.release()
+        if tactical_writer:
+            tactical_writer.release()
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
         
         # Temp cleanup
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         
         print(f"\n✅ Done! Output: {output_path}")
+        print(f"✅ Tactical: {tactical_output_path}")
         print(f"📊 Total objects tracked: {len(self.tracked_objects)}")
+        print(f"📊 Homography success: {self.homography_success_count}")
     
     def _extract_batch(self, cap, temp_dir: str, batch_size: int, frame_skip: int = 1) -> List[np.ndarray]:
         """Batch frame'leri çıkar ve diske kaydet.
