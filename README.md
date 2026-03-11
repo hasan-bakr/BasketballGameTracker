@@ -17,12 +17,12 @@ Bu proje, ham maç görüntülerini işleyerek anlamlı veriler çıkarmayı hed
 ### Öne Çıkan Özellik: Oyuncu ve Saha Segmentasyonu
 Projenin en güçlü yeteneklerinden biri, SAM2 kullanarak oyuncuları ve oyun alanını videodan piksel hassasiyetinde ayrıştırıp maskeleyebilmesidir.
 
-![Saha Segmentasyonu Demo](videos/output/sam2_robust_2_output.mp4)
+![Saha Segmentasyonu Demo](videos/sam2_robust_2_output_compressed.gif)
 
 ### Taktik Görünüm (Tactical View)
 Oyuncuların saha içindeki gerçek konumları, homografi (homography) ve saha anahtar noktaları kullanılarak 2D bir taktik haritaya yansıtılır.
 
-![Taktik Harita Demo](videos/output/sam2_robust_2_output_tactical.mp4)
+![Taktik Harita Demo](videos/sam2_robust_2_output_tactical.gif)
 
 
 ## ✨ Özellikler (Mevcut ve Planlanan)
