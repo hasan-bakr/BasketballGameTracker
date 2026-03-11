@@ -161,10 +161,11 @@ class JerseyDetector:
 
 # Test kodu
 if __name__ == "__main__":
+    import os
     detector = JerseyDetector()
     
     # Test klasörü
     results = detector.recognize_from_directory(
-        r'C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\jersey_crops'
+        os.path.join(str(project_root), "videos", "output", "jersey_crops")
     )
-    print(results)
+    print(results)

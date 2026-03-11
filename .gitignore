@@ -1,14 +1,57 @@
+# Python cache
 **/__pycache__/
 *.pyc
-.idea
-models/*
-data/*
-videos/output/*
-videos/input/*
+*.pyo
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+pyrightconfig.json
+
+# Model weights (büyük dosyalar)
 *.pt
 *.pth
-runs
-*.mp4
-*.yaml
-*.jpg
 *.onnx
+*.engine
+*.trt
+models/
+
+# Data & datasets
+data/
+datasets/
+
+# Videos
+videos/input/*
+videos/output/*
+*.mp4
+
+# Images (output/test)
+*.jpg
+*.jpeg
+*.png
+*.gif
+!basketball_analysis/images/basketball_court.png
+!README.md
+
+# YAML configs (model configs)
+*.yaml
+
+# Training outputs
+runs/
+
+# Temp directories
+temp_*/
+trt_cache/
+
+# SAM2/ONNX dirs
+sam2-hiera-base-plus-onnx/
+rf-detr-onnx/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

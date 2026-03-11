@@ -271,8 +271,11 @@ class RFDETRDetector:
 
 # ============ KULLANIM ÖRNEĞİ ============
 if __name__ == "__main__":
+    import os
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    
     # Model yolu
-    model_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\models\rfdetr-medium.onnx"
+    model_path = os.path.join(ROOT_DIR, "models", "rfdetr-medium.onnx")
     
     # Detector oluştur
     detector = RFDETRDetector(
@@ -282,7 +285,7 @@ if __name__ == "__main__":
     )
     
     # Test görseli
-    image_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\test_frame_4.jpg"
+    image_path = os.path.join(ROOT_DIR, "videos", "output", "test_frame_4.jpg")
     
     # Benchmark
     print("\n📊 Benchmark yapılıyor...")

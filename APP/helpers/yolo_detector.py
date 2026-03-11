@@ -169,15 +169,17 @@ if __name__ == "__main__":
     # detector = YoloDetector(model_path="yolo11n.pt") 
     
     # Custom model test
-    model_path = "models/yolo/best_detection.pt"
-    video_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\basketball_game.mp4"
-    output_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\yolo_only_inspection.mp4"
-    
     import os
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    model_path = os.path.join(ROOT_DIR, "models", "yolo", "best_detection.pt")
+    video_path = os.path.join(ROOT_DIR, "videos", "input", "basketball_game.mp4")
+    output_path = os.path.join(ROOT_DIR, "videos", "output", "yolo_only_inspection.mp4")
+    
     if os.path.exists(model_path) and os.path.exists(video_path):
         print("▶️ Running YOLO Inspection...")
         detector = YoloDetector(model_path=model_path)
         detector.detect_video(video_path, output_path=output_path, conf_threshold=0.3)
     else:
         print("⚠️ Model or Video not found for test.")
+
 

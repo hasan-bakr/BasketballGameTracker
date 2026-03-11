@@ -3,17 +3,19 @@ import cv2
 import os
 import time
 
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # -------------------------------
 # 1️⃣ MODELİ YÜKLE
 # -------------------------------
-model_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\models\yolo\best_seg.pt"
+model_path = os.path.join(ROOT_DIR, "models", "yolo", "best_seg.pt")
 model = YOLO(model_path)
 
 # -------------------------------
 # 2️⃣ VİDEOYU YÜKLE VE HAZIRLA
 # -------------------------------
-video_path = r'C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\court2.mp4'  # KENDİ VİDEONUZUN ADINI YAZIN
-output_video_path = r'C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\court2_segmentasyonlu.mp4' # KAYDEDİLECEK YOL VE İSİM
+video_path = os.path.join(ROOT_DIR, "videos", "input", "court2.mp4")  # KENDİ VİDEONUZUN ADINI YAZIN
+output_video_path = os.path.join(ROOT_DIR, "videos", "output", "court2_segmentasyonlu.mp4")  # KAYDEDİLECEK YOL VE İSİM
 
 cap = cv2.VideoCapture(video_path)
 

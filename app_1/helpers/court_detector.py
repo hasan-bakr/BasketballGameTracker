@@ -5,10 +5,12 @@ YOLOv11 segmentation modeli ile basketbol sahası tespiti.
 """
 
 import sys
+import os
 from pathlib import Path
 
 # Helpers klasörünü sys.path'e ekle
 helpers_dir = Path(__file__).resolve().parent
+project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(helpers_dir))
 
 import cv2
@@ -37,7 +39,7 @@ class CourtDetector:
         self.device = self.config.DEVICE
         
         # Model yolu
-        self.model_path = model_path or r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\models\yolo\best_seg.pt"
+        self.model_path = model_path or os.path.join(str(project_root), "models", "yolo", "best_seg.pt")
         
         self.model = None
         self.court_mask = None  # Cache için
@@ -188,7 +190,7 @@ if __name__ == "__main__":
     detector = CourtDetector()
     
     # Test frame
-    test_frame = cv2.imread(r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\test_frame_4.jpg")
+    test_frame = cv2.imread(os.path.join(str(project_root), "videos", "output", "test_frame_4.jpg"))
     
     if test_frame is not None:
         mask = detector.detect(test_frame)

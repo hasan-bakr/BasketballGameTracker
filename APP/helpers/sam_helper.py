@@ -303,10 +303,11 @@ class SAM2Helper:
 
 # ============ USAGE EXAMPLE ============
 if __name__ == "__main__":
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     helper = SAM2Helper()
     
     # Test image
-    img_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\test_frame_4.jpg"
+    img_path = os.path.join(ROOT_DIR, "videos", "output", "test_frame_4.jpg")
     if os.path.exists(img_path):
         bbox = [450, 200, 600, 500] # Example bbox
         
@@ -317,3 +318,4 @@ if __name__ == "__main__":
         helper.visualize(img_path, mask, bbox, save_path="sam_test_vis.jpg")
         
         helper.benchmark(img_path)
+

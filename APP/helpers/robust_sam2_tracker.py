@@ -15,6 +15,14 @@ import cv2
 import numpy as np
 import torch
 import gc
+from concurrent.futures import ThreadPoolExecutor
+
+# ═══════════════════════════════════════════════════════════════════════
+# Linux Performance: cuDNN benchmark mode
+# ═══════════════════════════════════════════════════════════════════════
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    print("⚡ cuDNN benchmark mode enabled (optimizes CUDA kernels for fixed-size inputs)")
 import shutil
 import sys
 from typing import Dict, List, Tuple, Optional
@@ -224,13 +232,23 @@ class RobustSAM2Tracker:
         if use_amp:
             print("⚡ AMP (FP16) enabled for ~2x speedup")
         
-        # Load models
-        self.yolo = YoloDetector(model_path=yolo_path, device="cpu")
+        # ── Load models ──────────────────────────────────────────────────
+        # Linux: YOLO artık GPU'da çalışıyor (Windows'ta VRAM sorunu nedeniyle CPU'daydı)
+        self.yolo = YoloDetector(model_path=yolo_path, device=device)
+        print(f"⚡ YOLO running on GPU ({device})")
+        
         self.predictor = build_sam2_video_predictor(sam2_config, sam2_checkpoint, device=device)
+        
+        # ── torch.compile() — Linux exclusive (Triton backend) ───────────
+        self._apply_torch_compile()
         
         # Jersey detector for Re-ID
         self.jersey_detector = JerseyDetector(device=device)
         self.jersey_bank = JerseyReIDBank()
+        
+        # Thread pool for async jersey detection (Phase 2)
+        self._jersey_executor = ThreadPoolExecutor(max_workers=2)
+        self._jersey_futures = []
         
         # Court Keypoint model
         kp_path = keypoint_model_path or DEFAULT_KEYPOINT_MODEL
@@ -267,6 +285,18 @@ class RobustSAM2Tracker:
         self.colors = [tuple(np.random.randint(50, 255, 3).tolist()) for _ in range(100)]
         
         print("✅ Robust SAM2 Tracker Ready!")
+    
+    def _apply_torch_compile(self):
+        """torch.compile() uygula — sadece Linux'ta çalışır (Triton backend).
+        Not: YOLO DetectionModel torch.compile ile uyumsuz (len() desteği yok),
+        sadece SAM2 predictor'a uygulanır.
+        """
+        try:
+            # SAM2 predictor'ı compile et
+            self.predictor = torch.compile(self.predictor, mode="reduce-overhead")
+            print("⚡ torch.compile() applied to SAM2 predictor (reduce-overhead mode)")
+        except Exception as e:
+            print(f"⚠️ torch.compile() skipped: {e}")
     
     # ═══════════════════════════════════════════════════════════════════════
     # IoU Hesaplama
@@ -506,7 +536,7 @@ class RobustSAM2Tracker:
         video_path: str,
         output_path: str,
         max_frames: int = 300,
-        batch_size: int = 50
+        batch_size: int = 150  # Linux: VRAM yönetimi daha iyi, batch büyütüldü (eski: 50)
     ):
         """Video işle ve çıktı kaydet (+ tactical view video)."""
         print(f"\n🎬 Processing: {video_path}")
@@ -527,7 +557,14 @@ class RobustSAM2Tracker:
         # Video writers
         writer = None
         tactical_writer = None
-        temp_dir = "temp_robust_frames"
+        
+        # Linux: /dev/shm (RAM disk) kullan — disk I/O yerine RAM'de çalışır (%30-50 daha hızlı)
+        if os.path.exists("/dev/shm"):
+            temp_dir = f"/dev/shm/sam2_tracker_{os.getpid()}"
+            print("⚡ Using RAM disk (/dev/shm) for temp frames — zero disk I/O")
+        else:
+            temp_dir = "temp_robust_frames"
+            print("📁 Using disk for temp frames (/dev/shm not available)")
         
         # Tactical video path
         base, ext = os.path.splitext(output_path)
@@ -578,9 +615,13 @@ class RobustSAM2Tracker:
                 local_idx = i
                 masks = batch_masks.get(local_idx, {})
                 
-                # Jersey tespiti (her 5 frame'de bir)
+                # Jersey tespiti (her 5 frame'de bir) — async thread ile
                 if masks and (frame_idx + i) % 5 == 0:
-                    self._detect_jerseys(frame, masks)
+                    # Önceki sonuçları topla
+                    self._collect_jersey_results()
+                    # Yeni tespiti arka planda başlat
+                    future = self._jersey_executor.submit(self._detect_jerseys, frame.copy(), masks.copy())
+                    self._jersey_futures.append(future)
                 
                 # SAM2 masks çiz
                 result = self.draw_masks_with_ids(frame, masks) if masks else frame.copy()
@@ -646,6 +687,9 @@ class RobustSAM2Tracker:
             frame_idx += len(frames)
             gc.collect()
             torch.cuda.empty_cache()
+        
+        # Kalan jersey sonuçlarını topla
+        self._collect_jersey_results()
         
         cap.release()
         if writer:
@@ -836,6 +880,7 @@ class RobustSAM2Tracker:
     def _detect_jerseys(self, frame: np.ndarray, masks: Dict[int, np.ndarray]):
         """
         YOLO ile jersey (class 2 = 'number') tespit et ve oyunculara eşleştir.
+        Thread-safe: sonuçları jersey_bank'e kaydeder.
         """
         # YOLO ile jersey tespitleri (class_id=2)
         all_detections = self.yolo.detect(frame, confidence_threshold=0.3)
@@ -845,6 +890,7 @@ class RobustSAM2Tracker:
             return
         
         # Her jersey tespitini en yakın oyuncu maskesiyle eşleştir
+        results = []  # (obj_id, number) pairs to register
         for jersey_det in jersey_detections:
             jersey_bbox = jersey_det['bbox']
             jersey_mask = self._bbox_to_mask(jersey_bbox, frame.shape[:2])
@@ -873,7 +919,26 @@ class RobustSAM2Tracker:
                     )
                     
                     if number:
-                        self.jersey_bank.register(best_match_id, number)
+                        results.append((best_match_id, number))
+        
+        # Register results (thread-safe: jersey_bank.register is simple dict assignment)
+        for obj_id, number in results:
+            self.jersey_bank.register(obj_id, number)
+    
+    def _collect_jersey_results(self):
+        """Tamamlanan async jersey tespitlerinin sonuçlarını topla."""
+        done_futures = []
+        for future in self._jersey_futures:
+            if future.done():
+                done_futures.append(future)
+                try:
+                    future.result()  # Hataları yakala
+                except Exception as e:
+                    print(f"⚠️ Async jersey detection error: {e}")
+        
+        # Tamamlananları listeden çıkar
+        for f in done_futures:
+            self._jersey_futures.remove(f)
     
     def _ocr_jersey(self, jersey_crop: np.ndarray) -> str:
         """Jersey crop'u üzerinde PARSeq OCR çalıştır."""
@@ -1009,12 +1074,12 @@ class RobustSAM2Tracker:
 
 
 if __name__ == "__main__":
-    video_in = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\court.mp4"
-    video_out = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\sam2_robust_2_output.mp4"
+    video_in = os.path.join(ROOT_DIR, "videos", "input", "court.mp4")
+    video_out = os.path.join(ROOT_DIR, "videos", "output", "sam2_robust_2_output.mp4")
     
     tracker = RobustSAM2Tracker(
         confidence_threshold=0.5,
         iou_threshold=0.3,
         redetect_interval=30
     )
-    tracker.process_video(video_in, video_out, max_frames=200)
+    tracker.process_video(video_in, video_out, max_frames=200, batch_size=150)

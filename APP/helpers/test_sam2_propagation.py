@@ -231,8 +231,10 @@ class SAM2BatchProcessor:
         return np.random.randint(0, 255, 3).tolist()
 
 if __name__ == "__main__":
-    mp4_in = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\basketball_game.mp4"
-    mp4_out = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\sam2_batch_output.mp4"
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    mp4_in = os.path.join(ROOT_DIR, "videos", "input", "basketball_game.mp4")
+    mp4_out = os.path.join(ROOT_DIR, "videos", "output", "sam2_batch_output.mp4")
     
     processor = SAM2BatchProcessor(mp4_in, mp4_out)
     processor.process_video(batch_size=50) # Safe batch size
+

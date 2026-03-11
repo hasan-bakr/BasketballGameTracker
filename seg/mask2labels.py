@@ -3,8 +3,9 @@ import cv2
 import numpy as np
 from skimage import measure
 
-mask_dir = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\data\seg\courtv2-Final\valid\masks"
-out_dir = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\seglab\labels"
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+mask_dir = os.path.join(ROOT_DIR, "data", "seg", "courtv2-Final", "valid", "masks")
+out_dir = os.path.join(ROOT_DIR, "seglab", "labels")
 os.makedirs(out_dir, exist_ok=True)
 
 for fname in os.listdir(mask_dir):

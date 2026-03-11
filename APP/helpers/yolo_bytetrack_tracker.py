@@ -157,7 +157,9 @@ def run_yolo_bytetrack(
 
 
 if __name__ == "__main__":
-    video_in = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\basketball_game.mp4"
-    video_out = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\yolo_bytetrack_output.mp4"
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    video_in = os.path.join(ROOT_DIR, "videos", "input", "basketball_game.mp4")
+    video_out = os.path.join(ROOT_DIR, "videos", "output", "yolo_bytetrack_output.mp4")
     
     run_yolo_bytetrack(video_in, video_out, max_frames=400, confidence=0.7)
+

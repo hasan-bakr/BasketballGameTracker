@@ -45,12 +45,15 @@ def benchmark_sam_model(model_id: str, image, input_boxes, runs: int = 20):
 
 
 if __name__ == "__main__":
+    import os
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    
     print("=" * 50)
     print("SAM2 Model Speed Benchmark")
     print("=" * 50)
     
     # Setup
-    image_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\test_frame_4.jpg"
+    image_path = os.path.join(ROOT_DIR, "videos", "output", "test_frame_4.jpg")
     image = Image.open(image_path).convert("RGB")
     
     # Single bbox test

@@ -90,8 +90,11 @@ def test_yolo_seg(video_path: str, output_path: str = None, model_name: str = "y
 
 
 if __name__ == "__main__":
-    video_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\basketball_game.mp4"
-    output_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\yolo_seg_test.mp4"
+    import os
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    video_path = os.path.join(ROOT_DIR, "videos", "input", "basketball_game.mp4")
+    output_path = os.path.join(ROOT_DIR, "videos", "output", "yolo_seg_test.mp4")
     
     # Test with yolo11l-seg (will auto-download if not present)
     test_yolo_seg(video_path, output_path, model_name="yolo11l-seg.pt")
+

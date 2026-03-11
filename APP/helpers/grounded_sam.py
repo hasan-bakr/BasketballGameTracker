@@ -302,6 +302,8 @@ class GroundedSAM:
 # ============ KULLANIM ÖRNEĞİ ============
 if __name__ == "__main__":
     import os
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    
     # Initialize Pipeline (RFDETR or YOLO) + SAM2
     # Force CPU for stable verification (avoid VRAM OOM)
     device = "cpu" 
@@ -311,10 +313,11 @@ if __name__ == "__main__":
     pipeline = GroundedSAM(device=device, detector_model="yolo") 
     
     # Video Path
-    video_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\basketball_game.mp4"
-    output_path = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\benchmark_yolo_result.mp4"
+    video_path = os.path.join(ROOT_DIR, "videos", "input", "basketball_game.mp4")
+    output_path = os.path.join(ROOT_DIR, "videos", "output", "benchmark_yolo_result.mp4")
     
     if os.path.exists(video_path):
         pipeline.process_video(video_path, output_path, conf_threshold=0.50, min_area=2000)
     else:
         print(f"❌ Video bulunamadı: {video_path}")
+

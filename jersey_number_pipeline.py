@@ -32,18 +32,20 @@ from pathlib import Path
 # ============================================
 # CONFIGURATION
 # ============================================
+_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 class Config:
     # Model paths
-    POSE_MODEL_PATH = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\yolo26m-pose.pt"
+    POSE_MODEL_PATH = os.path.join(_ROOT_DIR, "yolo26m-pose.pt")
     
     # OCR model
     PARSEQ_MODEL = "parseq_tiny"  # PARSeq Tiny: Scene Text Recognition (hızlı)
     
     # Input/Output paths
-    INPUT_VIDEO = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\basketball_game.mp4"
-    OUTPUT_DIR = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output"
-    CROPS_DIR = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\jersey_crops"
-    TEST_IMAGE_DIR = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\test"
+    INPUT_VIDEO = os.path.join(_ROOT_DIR, "videos", "input", "basketball_game.mp4")
+    OUTPUT_DIR = os.path.join(_ROOT_DIR, "videos", "output")
+    CROPS_DIR = os.path.join(_ROOT_DIR, "videos", "output", "jersey_crops")
+    TEST_IMAGE_DIR = os.path.join(_ROOT_DIR, "test")
     
     # Jersey crop settings
     JERSEY_EXPAND_RATIO = 0.4  # Crop bölgesini %40 genişlet (daha geniş jersey yakalama)
@@ -661,7 +663,7 @@ class SimpleJerseyExtractor:
     
     def __init__(self, pose_model_path):
         self.pose_model = YOLO(pose_model_path)
-        self.output_dir = r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\jersey_crops"
+        self.output_dir = os.path.join(_ROOT_DIR, "videos", "output", "jersey_crops")
         os.makedirs(self.output_dir, exist_ok=True)
     
     def extract_from_image(self, image_path):

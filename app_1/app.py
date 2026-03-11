@@ -474,9 +474,14 @@ if __name__ == "__main__":
     print("🎬 Video İşleniyor...")
     print("=" * 40)
     
-    pipeline.process_video(video_path=r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\input\basketball_game.mp4", show_preview=True, save_unique_crops=True)
+    import os
+    _ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    video_path = os.path.join(_ROOT_DIR, "videos", "input", "basketball_game.mp4")
+    pipeline.process_video(video_path=video_path, show_preview=True, save_unique_crops=True)
     
-    #pipeline.process_image(r"C:\Users\524ha\Desktop\Resources\BasketballGameTracker\videos\output\test_frame_4.jpg")
+    #test_image_path = os.path.join(_ROOT_DIR, "videos", "output", "test_frame_4.jpg")
+    #pipeline.process_image(test_image_path)
     print("\n" + "=" * 60)
     print("✅ Demo tamamlandı!")
     print("=" * 60)
+
