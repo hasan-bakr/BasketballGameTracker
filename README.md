@@ -1,71 +1,84 @@
 # Basketball Game Tracker 🏀
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
-![OpenCV](https://img.shields.io/badge/OpenCV-Computer%20Vision-green)
+![Python](https://img.shields.io/badge/Python-3.12-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.10-red)
+![SAM2](https://img.shields.io/badge/Model-SAM2-purple)
 ![YOLO](https://img.shields.io/badge/YOLO-Object%20Detection-orange)
-![Status](https://img.shields.io/badge/Status-In%20Development-yellow)
+![Status](https://img.shields.io/badge/Status-Active%20Development-success)
 
-Basketbol maçlarını analiz etmek, oyuncu/top takibi yapmak ve saha içi istatistikleri çıkarmak amacıyla geliştirilen yapay zeka tabanlı bir bilgisayarlı görü projesidir.
-
-> 🚧 **Not:** Bu proje şu anda aktif geliştirme aşamasındadır. Özellikler ve kod yapısı değişiklik gösterebilir.
+Basketbol maçlarını analiz etmek, oyuncu/top takibi yapmak, forma numaralarını okumak ve saha içi pozisyonları kuşbakışı (tactical view) haritaya yansıtmak amacıyla geliştirilen yapay zeka tabanlı gelişmiş bir bilgisayarlı görü projesidir.
 
 ## 🎯 Proje Hakkında
 
-Bu proje, ham maç görüntülerini işleyerek anlamlı veriler çıkarmayı hedefler. Derin öğrenme modelleri ve görüntü işleme teknikleri kullanılarak sahadaki nesneler algılanır ve konumlandırılır.
+Bu proje, ham maç görüntülerini işleyerek **Segment Anything Model 2 (SAM 2)** ve **YOLO** mimarilerinin gücüyle oyuncuları piksel hassasiyetinde takip eder. Gelişmiş Re-ID (Yeniden Tanımlama) algoritmaları ve Court Keypoint tespitiyle, sahadaki olayları 2 boyutlu taktiksel bir düzleme aktarır.
 
-### Öne Çıkan Özellik: Saha Segmentasyonu (Court Segmentation)
-Projenin şu anki en güçlü yeteneklerinden biri, oyun alanını videodan ayrıştırıp maskeleyebilmesidir. Bu özellik, oyuncuların saha içindeki gerçek konumlarını (homography kullanarak) 2D bir haritaya yansıtmak için temel oluşturur.
+### Yeni ve Öne Çıkan Özellikler
 
+* 🎯 **Robust SAM2 Tracking:** Bounding box yerine piksel bazlı oyuncu segmentasyonu ve hafıza (memory bank) destekli video yayılımı (propagation).
+* 🔢 **Jersey OCR & IoU Re-ID:** YOLO ile forma numaralarının tespiti, **PARSeq OCR** ile metne dönüştürülmesi ve geçici olarak kaybedilen oyuncuların aynı ID ile tekrar tanınması.
+* 🏟️ **Court Keypoint Detection:** Saha üzerindeki 18 stratejik referans noktasının özel bir model ile anlık kameradan tespiti.
+* 🗺️ **Tactical View (Bird's-Eye Projection):** Tespit edilen noktalar üzerinden **Homografi (Homography)** hesaplanarak kamera açısındaki oyuncuların 2D taktik haritasına (Mini-Map) gerçek zamanlı yansıtılması.
+* ⚡ **Performance:** Automatic Mixed Precision (AMP) ve TensorRT/ONNX optimizasyon yetenekleriyle hızlandırılmış işlem hattı.
 
+---
+
+### Eskiden Gelen Özellik: Saha Segmentasyonu (Court Segmentation)
+Oyun alanının videodan ayrıştırıp maskelenmesi.
 
 ![Saha Segmentasyonu Demo](CourtSegmentation.gif)
 
+---
 
-## ✨ Özellikler (Mevcut ve Planlanan)
+## ✨ Özellikler (Mevcut Durum)
 
-* [x] **Saha Segmentasyonu:** Oyun alanının tespiti ve maskelenmesi.
-* [ ] **Nesne Tespiti (Object Detection):** Oyuncuların, hakemlerin ve topun tespiti (YOLO).
-* [ ] **Takım Ayrıştırma:** Oyuncuların forma renklerine göre takımlara ayrılması.
-* [ ] **Perspektif Dönüşümü:** Kamera görüntüsünün 2D taktik tahtasına dönüştürülmesi.
-* [ ] **Hareket Takibi:** Oyuncuların hız ve kat ettikleri mesafenin hesaplanması.
+* [x] **SAM2 Segmentation:** Oyun alanı ve oyuncuların piksel bazlı maskelenmesi.
+* [x] **Nesne Tespiti (YOLO):** Oyuncuların ve formaların tespiti.
+* [x] **Takım / ID Ayrıştırma:** Forma numarası bazlı (Re-ID) oyuncu takibi.
+* [x] **Perspektif Dönüşümü (Homography):** Kamera görüntüsünün 2D taktik tahtasına dönüştürülmesi.
+* [ ] **Hareket Takibi & İstatistik:** Oyuncuların hız ve kat ettikleri mesafenin hesaplanması (Geliştirilecek).
 
 ## 🛠️ Kurulum
 
-Projeyi yerel makinenizde çalıştırmak için aşağıdaki adımları izleyin:
+Proje ana olarak `dsci` adlı bir Conda ortamı (Python 3.12, PyTorch 2.10, CUDA 13) hedeflenerek geliştirilmiştir.
 
 1.  **Repoyu klonlayın:**
     ```bash
-    git clone [https://github.com/hasan-bakr/BasketballGameTracker.git](https://github.com/hasan-bakr/BasketballGameTracker.git)
+    git clone https://github.com/hasan-bakr/BasketballGameTracker.git
     cd BasketballGameTracker
     ```
 
-2.  **Sanal ortam oluşturun (Önerilen):**
+2.  **Conda Ortamını Kurun ve Aktifleştirin:**
     ```bash
-    python -m venv venv
-    # Windows için:
-    venv\Scripts\activate
-    # Mac/Linux için:
-    source venv/bin/activate
+    conda create -n dsci python=3.12
+    conda activate dsci
     ```
 
 3.  **Gereksinimleri yükleyin:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+    Gereken ana kütüphaneler: `torch`, `torchvision`, `ultralytics`, `opencv-python`, `sam2` (Facebook Research), `scipy`, `tensorrt`.
 
 ## 🚀 Kullanım
 
-Modeli kendi videonuz üzerinde test etmek için:
+Yeni nesil takip ve taktik haritası sistemini ana script üzerinden test edebilirsiniz:
 
 ```bash
-python main.py --source "video_dosyasi.mp4"
+python APP/helpers/robust_sam2_tracker.py
+```
+> Çıktılar (hem ana video maskelemesi hem de taktiksel harita) `videos/output/` dizinine `.mp4` olarak kaydedilecektir.
 
+## 📂 Proje Yapısı
+
+\`\`\`text
 BasketballGameTracker/
-├── data/               # Test videoları ve görseller
-├── models/             # Eğitilmiş YOLO ve segmentasyon modelleri
-├── src/                # Kaynak kodlar
-│   ├── tracker.py      # Takip algoritmaları
-│   ├── segmentation.py # Saha segmentasyonu modülü
-│   └── utils.py        # Yardımcı fonksiyonlar
-├── main.py             # Ana çalıştırma dosyası
+├── APP/
+│   ├── helpers/                 # Ana Tracker, YOLO, Jersey OCR ve SAM2 scriptleri
+│   │   ├── robust_sam2_tracker.py   # 🌟 ANA ÇALIŞTIRMA DOSYASI
+│   │   ├── yolo_detector.py
+│   │   ├── jersey_detector.py
+│   │   └── sam_helper.py
+├── models/                      # Eğitilmiş YOLO, SAM2 ve Keypoint modelleri
+├── videos/                      # Girdi (input) ve Çıktı (output) videoları
+├── basketball_analysis/         # Eski/Referans yapılar ve Notebook'lar
+├── .vscode/                     # Düzenleyici ayarları (Jedi/Pylance config)
+├── .gitignore                   # Git yapılandırması
 └── README.md
+\`\`\`
