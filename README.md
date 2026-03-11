@@ -1,45 +1,41 @@
 # Basketball Game Tracker 🏀
 
-![Python](https://img.shields.io/badge/Python-3.12-blue)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.10-red)
-![SAM2](https://img.shields.io/badge/Model-SAM2-purple)
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
+![OpenCV](https://img.shields.io/badge/OpenCV-Computer%20Vision-green)
 ![YOLO](https://img.shields.io/badge/YOLO-Object%20Detection-orange)
-![Status](https://img.shields.io/badge/Status-Active%20Development-success)
+![SAM2](https://img.shields.io/badge/SAM2-Segmentation-purple)
+![Status](https://img.shields.io/badge/Status-In%20Development-yellow)
 
-Basketbol maçlarını analiz etmek, oyuncu/top takibi yapmak, forma numaralarını okumak ve saha içi pozisyonları kuşbakışı (tactical view) haritaya yansıtmak amacıyla geliştirilen yapay zeka tabanlı gelişmiş bir bilgisayarlı görü projesidir.
+Basketbol maçlarını analiz etmek, oyuncu/top takibi yapmak ve saha içi istatistikleri çıkarmak amacıyla geliştirilen yapay zeka tabanlı bir bilgisayarlı görü projesidir.
+
+> 🚧 **Not:** Bu proje şu anda aktif geliştirme aşamasındadır. Özellikler ve kod yapısı değişiklik gösterebilir.
 
 ## 🎯 Proje Hakkında
 
-Bu proje, ham maç görüntülerini işleyerek **Segment Anything Model 2 (SAM 2)** ve **YOLO** mimarilerinin gücüyle oyuncuları piksel hassasiyetinde takip eder. Gelişmiş Re-ID (Yeniden Tanımlama) algoritmaları ve Court Keypoint tespitiyle, sahadaki olayları 2 boyutlu taktiksel bir düzleme aktarır.
+Bu proje, ham maç görüntülerini işleyerek anlamlı veriler çıkarmayı hedefler. Derin öğrenme modelleri ve görüntü işleme teknikleri kullanılarak sahadaki nesneler algılanır ve konumlandırılır.
 
-### Yeni ve Öne Çıkan Özellikler
+### Öne Çıkan Özellik: Oyuncu ve Saha Segmentasyonu
+Projenin en güçlü yeteneklerinden biri, SAM2 kullanarak oyuncuları ve oyun alanını videodan piksel hassasiyetinde ayrıştırıp maskeleyebilmesidir.
 
-* 🎯 **Robust SAM2 Tracking:** Bounding box yerine piksel bazlı oyuncu segmentasyonu ve hafıza (memory bank) destekli video yayılımı (propagation).
-* 🔢 **Jersey OCR & IoU Re-ID:** YOLO ile forma numaralarının tespiti, **PARSeq OCR** ile metne dönüştürülmesi ve geçici olarak kaybedilen oyuncuların aynı ID ile tekrar tanınması.
-* 🏟️ **Court Keypoint Detection:** Saha üzerindeki 18 stratejik referans noktasının özel bir model ile anlık kameradan tespiti.
-* 🗺️ **Tactical View (Bird's-Eye Projection):** Tespit edilen noktalar üzerinden **Homografi (Homography)** hesaplanarak kamera açısındaki oyuncuların 2D taktik haritasına (Mini-Map) gerçek zamanlı yansıtılması.
-* ⚡ **Performance:** Automatic Mixed Precision (AMP) ve TensorRT/ONNX optimizasyon yetenekleriyle hızlandırılmış işlem hattı.
+![Saha Segmentasyonu Demo](videos/output/sam2_robust_2_output.mp4)
 
----
+### Taktik Görünüm (Tactical View)
+Oyuncuların saha içindeki gerçek konumları, homografi (homography) ve saha anahtar noktaları kullanılarak 2D bir taktik haritaya yansıtılır.
 
-### Eskiden Gelen Özellik: Saha Segmentasyonu (Court Segmentation)
-Oyun alanının videodan ayrıştırıp maskelenmesi.
+![Taktik Harita Demo](videos/output/sam2_robust_2_output_tactical.mp4)
 
-![Saha Segmentasyonu Demo](CourtSegmentation.gif)
 
----
+## ✨ Özellikler (Mevcut ve Planlanan)
 
-## ✨ Özellikler (Mevcut Durum)
-
-* [x] **SAM2 Segmentation:** Oyun alanı ve oyuncuların piksel bazlı maskelenmesi.
-* [x] **Nesne Tespiti (YOLO):** Oyuncuların ve formaların tespiti.
-* [x] **Takım / ID Ayrıştırma:** Forma numarası bazlı (Re-ID) oyuncu takibi.
-* [x] **Perspektif Dönüşümü (Homography):** Kamera görüntüsünün 2D taktik tahtasına dönüştürülmesi.
-* [ ] **Hareket Takibi & İstatistik:** Oyuncuların hız ve kat ettikleri mesafenin hesaplanması (Geliştirilecek).
+* [x] **Saha Segmentasyonu:** Oyun alanının tespiti ve maskelenmesi.
+* [x] **Nesne Tespiti (Object Detection):** Oyuncuların, hakemlerin ve topun tespiti (YOLO + SAM2 Tracking).
+* [x] **Takım Ayrıştırma:** Oyuncuların forma numaralarına göre ayrıştırılması (Jersey OCR & Re-ID).
+* [x] **Perspektif Dönüşümü:** Kamera görüntüsünün 2D taktik tahtasına dönüştürülmesi (Homografi).
+* [ ] **Hareket Takibi:** Oyuncuların hız ve kat ettikleri mesafenin hesaplanması.
 
 ## 🛠️ Kurulum
 
-Proje ana olarak `dsci` adlı bir Conda ortamı (Python 3.12, PyTorch 2.10, CUDA 13) hedeflenerek geliştirilmiştir.
+Projeyi yerel makinenizde çalıştırmak için aşağıdaki adımları izleyin:
 
 1.  **Repoyu klonlayın:**
     ```bash
@@ -47,38 +43,25 @@ Proje ana olarak `dsci` adlı bir Conda ortamı (Python 3.12, PyTorch 2.10, CUDA
     cd BasketballGameTracker
     ```
 
-2.  **Conda Ortamını Kurun ve Aktifleştirin:**
+2.  **Sanal ortam oluşturun (Conda Önerilir):**
     ```bash
     conda create -n dsci python=3.12
     conda activate dsci
     ```
 
 3.  **Gereksinimleri yükleyin:**
-    Gereken ana kütüphaneler: `torch`, `torchvision`, `ultralytics`, `opencv-python`, `sam2` (Facebook Research), `scipy`, `tensorrt`.
+    Gereken ana paketler: `torch`, `torchvision`, `ultralytics`, `opencv-python`, `sam2`.
 
 ## 🚀 Kullanım
 
-Yeni nesil takip ve taktik haritası sistemini ana script üzerinden test edebilirsiniz:
+Modeli test etmek için ana tracker dosyasını çalıştırın:
 
 ```bash
 python APP/helpers/robust_sam2_tracker.py
 ```
-> Çıktılar (hem ana video maskelemesi hem de taktiksel harita) `videos/output/` dizinine `.mp4` olarak kaydedilecektir.
 
-## 📂 Proje Yapısı
-
-\`\`\`text
-BasketballGameTracker/
-├── APP/
-│   ├── helpers/                 # Ana Tracker, YOLO, Jersey OCR ve SAM2 scriptleri
-│   │   ├── robust_sam2_tracker.py   # 🌟 ANA ÇALIŞTIRMA DOSYASI
-│   │   ├── yolo_detector.py
-│   │   ├── jersey_detector.py
-│   │   └── sam_helper.py
-├── models/                      # Eğitilmiş YOLO, SAM2 ve Keypoint modelleri
-├── videos/                      # Girdi (input) ve Çıktı (output) videoları
-├── basketball_analysis/         # Eski/Referans yapılar ve Notebook'lar
-├── .vscode/                     # Düzenleyici ayarları (Jedi/Pylance config)
-├── .gitignore                   # Git yapılandırması
-└── README.md
-\`\`\`
+📂 **Proje Yapısı Özet:**
+* `APP/helpers/`: Tracker mantığı, SAM2 ve YOLO entegrasyonu.
+* `videos/output/`: İşlenmiş demo videoların kaydedildiği dizin.
+* `models/`: YOLO ve diğer ağırlık dosyaları.
+* `basketball_analysis/`: Analiz ve araç dosyaları.
