@@ -210,7 +210,7 @@ class RobustSAM2Tracker:
     
     def __init__(
         self,
-        sam2_config: str = "configs/sam2.1/sam2.1_hiera_t.yaml",  # SAM2.1 tiny (faster)
+        sam2_config: str = "configs/sam2.1/sam2.1_hiera_t",  # SAM2.1 tiny - Hydra path from sam2 package
         sam2_checkpoint: str = "models/sam2.1_hiera_tiny.pt",
         yolo_path: str = "models/yolo/best_detection.pt",
         device: str = "cuda",
@@ -218,6 +218,7 @@ class RobustSAM2Tracker:
         iou_threshold: float = 0.3,
         redetect_interval: int = 30,
         use_amp: bool = True,  # Enable Automatic Mixed Precision for ~2x speedup
+        use_vos_optimized: bool = True,  # SAM 2.1 VOS optimization (major speedup)
         keypoint_model_path: str = None,
         court_image_path: str = None
     ):
@@ -228,16 +229,26 @@ class RobustSAM2Tracker:
         self.iou_threshold = iou_threshold
         self.redetect_interval = redetect_interval
         self.use_amp = use_amp
+        self.use_vos_optimized = use_vos_optimized
         
         if use_amp:
             print("⚡ AMP (FP16) enabled for ~2x speedup")
+        
+        if use_vos_optimized:
+            print("⚡ VOS optimized mode enabled (SAM 2.1 feature)")
         
         # ── Load models ──────────────────────────────────────────────────
         # Linux: YOLO artık GPU'da çalışıyor (Windows'ta VRAM sorunu nedeniyle CPU'daydı)
         self.yolo = YoloDetector(model_path=yolo_path, device=device)
         print(f"⚡ YOLO running on GPU ({device})")
         
-        self.predictor = build_sam2_video_predictor(sam2_config, sam2_checkpoint, device=device)
+        # SAM2.1 with vos_optimized for speedup
+        self.predictor = build_sam2_video_predictor(
+            sam2_config, 
+            sam2_checkpoint, 
+            device=device,
+            vos_optimized=use_vos_optimized
+        )
         
         # ── torch.compile() — Linux exclusive (Triton backend) ───────────
         self._apply_torch_compile()

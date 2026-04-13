@@ -32,7 +32,6 @@ videos/output/*
 *.jpeg
 *.png
 *.gif
-!basketball_analysis/images/basketball_court.png
 !README.md
 
 # YAML configs (model configs)
@@ -45,9 +44,17 @@ runs/
 temp_*/
 trt_cache/
 
-# SAM2/ONNX dirs
+# External repos / submodules (local reference copies)
 sam2-hiera-base-plus-onnx/
 rf-detr-onnx/
+HRNet-Human-Pose-Estimation/
+basketball_analysis/
+court_analysis_ref/
+parseq/
+sn-calibration/
+
+# Personal notes
+sunum_notlari.txt
 
 # System
 .DS_Store

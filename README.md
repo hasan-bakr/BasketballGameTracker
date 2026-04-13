@@ -1,67 +1,127 @@
-# Basketball Game Tracker 🏀
+# Basketball Game Tracker
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
-![OpenCV](https://img.shields.io/badge/OpenCV-Computer%20Vision-green)
+![Python](https://img.shields.io/badge/Python-3.12-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-Deep%20Learning-red)
 ![YOLO](https://img.shields.io/badge/YOLO-Object%20Detection-orange)
 ![SAM2](https://img.shields.io/badge/SAM2-Segmentation-purple)
 ![Status](https://img.shields.io/badge/Status-In%20Development-yellow)
 
-Basketbol maçlarını analiz etmek, oyuncu/top takibi yapmak ve saha içi istatistikleri çıkarmak amacıyla geliştirilen yapay zeka tabanlı bir bilgisayarlı görü projesidir.
+An AI-powered computer vision pipeline for analyzing basketball game footage — detecting players, tracking them across frames, reading jersey numbers, and projecting positions onto a 2D tactical map.
 
-> 🚧 **Not:** Bu proje şu anda aktif geliştirme aşamasındadır. Özellikler ve kod yapısı değişiklik gösterebilir.
+## Demo
 
-## 🎯 Proje Hakkında
+**Player Segmentation & Tracking (SAM2)**
 
-Bu proje, ham maç görüntülerini işleyerek anlamlı veriler çıkarmayı hedefler. Derin öğrenme modelleri ve görüntü işleme teknikleri kullanılarak sahadaki nesneler algılanır ve konumlandırılır.
+![Segmentation Demo](videos/sam2_robust_2_output_compressed.gif)
 
-### Öne Çıkan Özellik: Oyuncu ve Saha Segmentasyonu
-Projenin en güçlü yeteneklerinden biri, SAM2 kullanarak oyuncuları ve oyun alanını videodan piksel hassasiyetinde ayrıştırıp maskeleyebilmesidir.
+**Tactical Bird's-eye View**
 
-![Saha Segmentasyonu Demo](videos/sam2_robust_2_output_compressed.gif)
+![Tactical Map Demo](videos/sam2_robust_2_output_tactical.gif)
 
-### Taktik Görünüm (Tactical View)
-Oyuncuların saha içindeki gerçek konumları, homografi (homography) ve saha anahtar noktaları kullanılarak 2D bir taktik haritaya yansıtılır.
+## Features
 
-![Taktik Harita Demo](videos/sam2_robust_2_output_tactical.gif)
+| Feature | Status |
+|---|---|
+| Player & ball detection (YOLO) | ✅ |
+| Instance segmentation & tracking (SAM2) | ✅ |
+| Jersey number OCR (PARSeq) | ✅ |
+| Player Re-ID via jersey voting | ✅ |
+| Court keypoint detection (YOLO-Pose, 18 pts) | ✅ |
+| Camera-to-court homography | ✅ |
+| 2D tactical view projection | ✅ |
+| Speed / distance calculation | 🔲 |
 
+## Architecture
 
-## ✨ Özellikler (Mevcut ve Planlanan)
+```
+Input Video
+    │
+    ▼
+YOLO Detection ──────────────────────────────────────┐
+(players, ball, rim, jersey numbers)                 │
+    │                                                │
+    ▼                                                │
+SAM2 Video Propagation                               │
+(pixel-level segmentation, memory bank)              │
+    │                                                │
+    ▼                                                ▼
+IoU Re-ID (Hungarian algorithm)        Jersey OCR (PARSeq)
+    │                                  (async, per player)
+    │                                                │
+    └──────────────────┬─────────────────────────────┘
+                       ▼
+          Court Keypoint Detection (YOLO-Pose)
+          + Homography (RANSAC, temporal blend)
+                       │
+                       ▼
+              Tactical Bird's-eye View
+```
 
-* [x] **Saha Segmentasyonu:** Oyun alanının tespiti ve maskelenmesi.
-* [x] **Nesne Tespiti (Object Detection):** Oyuncuların, hakemlerin ve topun tespiti (YOLO + SAM2 Tracking).
-* [x] **Takım Ayrıştırma:** Oyuncuların forma numaralarına göre ayrıştırılması (Jersey OCR & Re-ID).
-* [x] **Perspektif Dönüşümü:** Kamera görüntüsünün 2D taktik tahtasına dönüştürülmesi (Homografi).
-* [ ] **Hareket Takibi:** Oyuncuların hız ve kat ettikleri mesafenin hesaplanması.
+## Project Structure
 
-## 🛠️ Kurulum
+```
+APP/helpers/
+├── robust_sam2_tracker.py    # Main pipeline (entry point)
+├── yolo_detector.py          # YOLO wrapper (custom basketball classes)
+├── jersey_detector.py        # PARSeq OCR + JerseyReIDBank voting
+├── court_keypoint_detector.py # 18-point court landmark detection + EMA
+├── homography_transformer.py  # RANSAC homography + temporal blending
+├── generate_tactical_view.py  # Standalone tactical view generator
+├── sam_helper.py             # SAM2 ONNX segmentation
+├── manual_court_selector.py   # Interactive court point selection (OpenCV GUI)
+├── rfdetr_detector.py        # RF-DETR alternative detector
+└── download_court_model.py   # Court model download utility
 
-Projeyi yerel makinenizde çalıştırmak için aşağıdaki adımları izleyin:
+videos/
+├── sam2_robust_2_output_compressed.gif  # Tracking demo
+└── sam2_robust_2_output_tactical.gif    # Tactical view demo
+```
 
-1.  **Repoyu klonlayın:**
-    ```bash
-    git clone https://github.com/hasan-bakr/BasketballGameTracker.git
-    cd BasketballGameTracker
-    ```
+## Setup
 
-2.  **Sanal ortam oluşturun (Conda Önerilir):**
-    ```bash
-    conda create -n dsci python=3.12
-    conda activate dsci
-    ```
+### Requirements
 
-3.  **Gereksinimleri yükleyin:**
-    Gereken ana paketler: `torch`, `torchvision`, `ultralytics`, `opencv-python`, `sam2`.
+- Python 3.12
+- CUDA-capable GPU (recommended)
+- Conda
 
-## 🚀 Kullanım
+```bash
+git clone https://github.com/hasan-bakr/BasketballGameTracker.git
+cd BasketballGameTracker
 
-Modeli test etmek için ana tracker dosyasını çalıştırın:
+conda create -n dsci python=3.12
+conda activate dsci
+
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install ultralytics opencv-python scipy tqdm
+pip install sam2
+```
+
+### Models
+
+Place model weights in `models/`:
+- `best_detection.pt` — Custom YOLO for basketball (players, ball, rim, jersey number)
+- `sam2.1_hiera_base_plus.pt` — SAM2.1 checkpoint
+- `models/keypoints/best.pt` — Court keypoint YOLO-Pose model
+
+### Run
 
 ```bash
 python APP/helpers/robust_sam2_tracker.py
 ```
 
-📂 **Proje Yapısı Özet:**
-* `APP/helpers/`: Tracker mantığı, SAM2 ve YOLO entegrasyonu.
-* `videos/output/`: İşlenmiş demo videoların kaydedildiği dizin.
-* `models/`: YOLO ve diğer ağırlık dosyaları.
-* `basketball_analysis/`: Analiz ve araç dosyaları.
+## Tech Stack
+
+- **Detection:** [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) (custom trained)
+- **Segmentation & Tracking:** [SAM2](https://github.com/facebookresearch/sam2) (Meta AI)
+- **Jersey OCR:** [PARSeq](https://github.com/baudm/parseq) (scene text recognition)
+- **Court Geometry:** YOLO-Pose → RANSAC Homography
+- **Re-ID:** IoU matching + Hungarian algorithm + jersey number voting
+
+---
+
+## Proje Özeti (Türkçe)
+
+Basketbol maçı görüntülerini analiz eden yapay zeka tabanlı bir bilgisayarlı görü sistemi. Ham video girdisinden oyuncu tespiti, piksel hassasiyetinde takip, forma numarası tanıma ve 2D taktik harita çıktısı üretir.
+
+**Ana modüller:** YOLO (tespit) → SAM2 (segmentasyon & takip) → PARSeq (OCR) → Homografi → Taktik görünüm
