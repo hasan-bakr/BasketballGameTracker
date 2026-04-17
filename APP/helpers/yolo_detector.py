@@ -26,9 +26,10 @@ class YoloDetector:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             
         print(f"📦 Loading YOLO Model: {model_path} ({device})...")
-        self.model = YOLO(model_path)
+        self.model = YOLO(model_path, task="detect")
         self.device = device
-        self.model.to(device)
+        if not model_path.endswith(".onnx"):
+            self.model.to(device)
         print(f"✅ YOLO Model loaded: {model_path}")
 
     def detect(self, image: Union[str, np.ndarray], confidence_threshold: float = 0.5, classes: List[int] = None) -> List[Dict]:
@@ -50,10 +51,11 @@ class YoloDetector:
         # stream=False -> return Results list
         # verbose=False -> reduce print noise
         results = self.model.predict(
-            source=image, 
-            conf=confidence_threshold, 
-            classes=classes, 
+            source=image,
+            conf=confidence_threshold,
+            classes=classes,
             device=self.device,
+            half=self.device == 'cuda',
             verbose=False
         )
         

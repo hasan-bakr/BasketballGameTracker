@@ -28,18 +28,14 @@ class JerseyDetector:
     - Karakter → Sayı dönüşümü (O→0, I→1, vb.)
     """
     
-    # Karakter → Sayı benzerlikleri
+    # Görsel benzerliği yüksek, güvenilir karakter → rakam dönüşümleri
+    # Sadece OCR'ın neredeyse kesinlikle yanlış tanıyacağı karakterler
     CHAR_TO_DIGIT = {
-        'O': '0', 'o': '0', 'Q': '0', 'D': '0',
+        'O': '0', 'o': '0', 'Q': '0',
         'I': '1', 'l': '1', 'i': '1', '|': '1',
-        'Z': '2', 'z': '2',
-        'E': '3',
-        'A': '4', 'h': '4',
+        'Z': '2',
         'S': '5', 's': '5',
-        'G': '6', 'b': '6',
-        'T': '7', 't': '7',
         'B': '8',
-        'g': '9', 'q': '9',
     }
     
     def __init__(
@@ -248,17 +244,22 @@ class JerseyReIDBank:
         # Eğer yeterli tespit varsa (en az 3 kez)
         if counts[best_number] >= 3:
             old_jersey = self.obj_to_jersey.get(obj_id)
-            
+
             if old_jersey != best_number:
+                # Bu numara zaten başka bir ID'ye kayıtlıysa, çakışmayı engelle
+                existing_owner = self.jersey_to_obj.get(best_number)
+                if existing_owner is not None and existing_owner != obj_id:
+                    return
+
                 # Eski eşleştirmeyi kaldır
                 if old_jersey and self.jersey_to_obj.get(old_jersey) == obj_id:
                     del self.jersey_to_obj[old_jersey]
-                
+
                 # Yeni eşleştirmeyi kaydet
                 self.obj_to_jersey[obj_id] = best_number
                 self.jersey_to_obj[best_number] = obj_id
-                
-                print(f"   📝 Jersey registered: ID {obj_id} → #{best_number}")
+
+                print(f"   Jersey registered: ID {obj_id} → #{best_number}")
     
     def find_by_jersey(self, jersey_number: str) -> Optional[int]:
         """

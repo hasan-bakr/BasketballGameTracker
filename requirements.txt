@@ -1,0 +1,9 @@
+torch>=2.0
+torchvision
+ultralytics>=8.0
+opencv-python>=4.8
+numpy
+scipy
+tqdm
+sam2
+huggingface_hub

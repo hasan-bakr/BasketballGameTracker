@@ -60,17 +60,23 @@ IoU Re-ID (Hungarian algorithm)        Jersey OCR (PARSeq)
 ## Project Structure
 
 ```
-APP/helpers/
-├── robust_sam2_tracker.py    # Main pipeline (entry point)
-├── yolo_detector.py          # YOLO wrapper (custom basketball classes)
-├── jersey_detector.py        # PARSeq OCR + JerseyReIDBank voting
-├── court_keypoint_detector.py # 18-point court landmark detection + EMA
-├── homography_transformer.py  # RANSAC homography + temporal blending
-├── generate_tactical_view.py  # Standalone tactical view generator
-├── sam_helper.py             # SAM2 ONNX segmentation
-├── manual_court_selector.py   # Interactive court point selection (OpenCV GUI)
-├── rfdetr_detector.py        # RF-DETR alternative detector
-└── download_court_model.py   # Court model download utility
+APP/
+├── __main__.py               # CLI entry point  →  python -m APP
+├── helpers/
+│   ├── robust_sam2_tracker.py  # Main tracker pipeline
+│   ├── yolo_detector.py        # YOLO wrapper (basketball classes)
+│   ├── jersey_detector.py      # PARSeq OCR + JerseyReIDBank
+│   ├── court_utils.py          # Court constants, homography, tactical view
+│   ├── visualization.py        # Mask overlay drawing
+│   ├── court_keypoint_detector.py
+│   ├── homography_transformer.py
+│   ├── generate_tactical_view.py
+│   ├── sam_helper.py           # SAM2 ONNX (single-frame)
+│   ├── manual_court_selector.py
+│   ├── rfdetr_detector.py
+│   └── download_court_model.py
+└── assets/
+    └── basketball_court.png    # Court template for tactical view
 
 videos/
 ├── sam2_robust_2_output_compressed.gif  # Tracking demo
@@ -93,8 +99,7 @@ conda create -n dsci python=3.12
 conda activate dsci
 
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install ultralytics opencv-python scipy tqdm
-pip install sam2
+pip install -r requirements.txt
 ```
 
 ### Models
@@ -107,7 +112,20 @@ Place model weights in `models/`:
 ### Run
 
 ```bash
-python APP/helpers/robust_sam2_tracker.py
+python -m APP --input videos/input/game.mp4 --output videos/output/result.mp4
+```
+
+**All options:**
+```
+--input / -i       Input video path (required)
+--output / -o      Output video path (required)
+--max-frames       Frames to process (default: 300)
+--batch-size       SAM2 batch size (default: 150)
+--confidence       YOLO threshold (default: 0.5)
+--device           cuda or cpu (default: cuda)
+--sam2-checkpoint  Path to SAM2 .pt file
+--yolo-model       Path to YOLO .pt file
+--no-amp           Disable FP16 mixed precision
 ```
 
 ## Tech Stack
