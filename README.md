@@ -106,7 +106,7 @@ pip install -r requirements.txt
 
 Place model weights in `models/`:
 - `best_detection.pt` — Custom YOLO for basketball (players, ball, rim, jersey number)
-- `sam2.1_hiera_base_plus.pt` — SAM2.1 checkpoint
+- `sam2.1_hiera_base_plus.pt` — default SAM2.1 checkpoint
 - `models/keypoints/best.pt` — Court keypoint YOLO-Pose model
 
 ### Run

@@ -12,6 +12,7 @@ Provides:
 import os
 import cv2
 import numpy as np
+from collections import deque
 from typing import Dict, List, Tuple
 
 
@@ -23,8 +24,11 @@ class SAM2PipelineMixin:
       self.tracked_objects, self.next_obj_id,
       self.PLAYER_CLASSES, self.PLAYER_MIN_CONF,
       self.KEYPOINT_BORDER_MARGIN, self.SAM2_MASK_LOGIT_THRESHOLD,
-      self.MIN_MASK_AREA, self._is_valid_player_bbox(), _bbox_iou(), _mask_iou()
+            self._is_valid_player_bbox(), _bbox_iou(), _mask_iou()
     """
+
+    # Kaç batch'lik geçmiş memory tutulacak (batch_size * bu değer = toplam frame)
+    CROSS_BATCH_MEMORY_BATCHES = 3
 
     # ── SAM2 prompt helper ────────────────────────────────────────────────────
 
@@ -33,9 +37,9 @@ class SAM2PipelineMixin:
         x1: float, y1: float, x2: float, y2: float,
         scale_x: float, scale_y: float,
     ):
-        """Bbox'tan SAM2 için tek foreground nokta üret: chest-level (%30)."""
+        """Bbox'tan SAM2 için tek foreground nokta üret: upper-torso (%55)."""
         cx = ((x1 + x2) / 2) * scale_x
-        cy = (y1 + 0.30 * (y2 - y1)) * scale_y
+        cy = (y1 + 0.55 * (y2 - y1)) * scale_y
         points = np.array([[cx, cy]], dtype=np.float32)
         labels = np.array([1],        dtype=np.int32)
         return points, labels
@@ -78,6 +82,7 @@ class SAM2PipelineMixin:
 
         frames = []
         saved_idx = 0
+        keep_original_frames = batch_size <= 60
 
         for i in range(batch_size * frame_skip):
             ret, frame = cap.read()
@@ -85,7 +90,6 @@ class SAM2PipelineMixin:
                 break
             if i % frame_skip != 0:
                 continue
-            frames.append(frame)
 
             # SAM2 JPEG: max dim 1024 (optimal for SAM2)
             h, w = frame.shape[:2]
@@ -95,6 +99,7 @@ class SAM2PipelineMixin:
             else:
                 frame_sam2 = frame
 
+            frames.append(frame if keep_original_frames else frame_sam2)
             cv2.imwrite(f"{temp_dir}/{saved_idx:05d}.jpg", frame_sam2)
             saved_idx += 1
 
@@ -157,13 +162,12 @@ class SAM2PipelineMixin:
             for d in player_dets:
                 if not self._is_valid_player_bbox(d['bbox'], court_kp, frame.shape[:2]):
                     continue
-                # x1, y1, x2, y2 = d['bbox']
-                # h_bb = y2 - y1
-                # w_bb = x2 - x1
-                # Boyut ve aspect ratio filtreleri — aktif etmek için yorumu kaldır:
-                # if h_bb < self.PLAYER_MIN_HEIGHT_PX: continue
-                # if h_bb * w_bb < self.PLAYER_MIN_AREA_PX: continue
-                # if h_bb / max(w_bb, 1) < self.MASK_MIN_ASPECT: continue
+                dx1, dy1, dx2, dy2 = d['bbox']
+                # Kenar filtresi
+                ih_f, iw_f = frame.shape[:2]
+                iem = self.PLAYER_EDGE_MARGIN_PX
+                if dx1 < iem or dy1 < iem or dx2 > iw_f - iem or dy2 > ih_f - iem:
+                    continue
                 in_court.append(d)
 
             # ── Clustering / jump-ball tespiti ────────────────────────────────────
@@ -225,7 +229,7 @@ class SAM2PipelineMixin:
             x1, y1, x2, y2 = det['bbox']
 
             chest_x = int((x1 + x2) / 2)
-            chest_y = int(y1 + 0.30 * (y2 - y1))
+            chest_y = int(y1 + 0.55 * (y2 - y1))
             prompt_inside_existing = False
             for obj in self.tracked_objects.values():
                 m = obj.get("last_mask")
@@ -251,7 +255,7 @@ class SAM2PipelineMixin:
                 "last_mask": None, "confidence": 1.0, "lost_count": 0,
                 "is_referee": False,
                 "initial_area": None,
-                "degraded": False,
+
             }
             self._record_prompt(best_frame_idx, obj_id, det['bbox'], "init")
 
@@ -275,7 +279,7 @@ class SAM2PipelineMixin:
                 "last_mask": None, "confidence": det['confidence'],
                 "lost_count": 0, "is_referee": True,
                 "initial_area": None,
-                "degraded": False,
+
             }
             self._record_prompt(best_frame_idx, obj_id, det['bbox'], "init_ref")
         if ref_dets:
@@ -362,6 +366,12 @@ class SAM2PipelineMixin:
                 if (x2 - x1) * (y2 - y1) < self.PLAYER_MIN_AREA_PX:
                     continue
 
+                # Kenar filtresi — kenara çok yakın detectionlar seed edilmez
+                h_f, w_f = frame.shape[:2]
+                em = self.PLAYER_EDGE_MARGIN_PX
+                if x1 < em or y1 < em or x2 > w_f - em or y2 > h_f - em:
+                    continue
+
                 # Zaten takip edilen bir nesneyle örtüşüyor mu?
                 det_mask = self._bbox_to_mask(det['bbox'], frame.shape[:2])
                 det_area = int(det_mask.sum())
@@ -385,7 +395,7 @@ class SAM2PipelineMixin:
                     continue
 
                 chest_x = int((x1 + x2) / 2)
-                chest_y = int(y1 + 0.30 * (y2 - y1))
+                chest_y = int(y1 + 0.55 * (y2 - y1))
                 prompt_inside_existing = False
                 for obj in self.tracked_objects.values():
                     m = obj.get("last_mask")
@@ -414,7 +424,7 @@ class SAM2PipelineMixin:
                     "lost_count": 0,
                     "is_referee": False,
                     "initial_area": None,
-                    "degraded": False,
+    
                 }
                 # current_boxes güncelle ki sonraki frame'lerde çakışma olmasın
                 current_boxes.append(det_mask)
@@ -441,20 +451,11 @@ class SAM2PipelineMixin:
 
         Masks are resized to match the SAM2 input resolution (same as the JPEG
         frames written by _extract_batch), NOT a fixed 256x256.
-
-        Degraded objects (mask area shrank significantly) receive a fresh YOLO
-        point prompt instead of the degraded mask — this prevents drift.
         """
         ref = cv2.imread(os.path.join(temp_dir, "00000.jpg"))
         h_ref, w_ref = ref.shape[:2]
 
-        degraded_ids = [oid for oid, obj in self.tracked_objects.items()
-                        if obj.get("degraded", False)]
-
-        # Normal objects: mask prompt (unchanged)
         for obj_id, obj_data in self.tracked_objects.items():
-            if obj_id in degraded_ids:
-                continue
             if obj_data["last_mask"] is not None:
                 mask_resized = cv2.resize(
                     obj_data["last_mask"].astype(np.float32), (w_ref, h_ref)
@@ -468,12 +469,114 @@ class SAM2PipelineMixin:
                 bbox = self._mask_to_bbox(obj_data["last_mask"])
                 self._record_prompt(0, obj_id, bbox, "continue_mask")
 
-        # Degraded objects: YOLO-backed point prompt
-        if degraded_ids and first_frame is not None:
-            self._reprompt_degraded(
-                inference_state, degraded_ids, first_frame,
-                temp_dir, h_ref, w_ref,
-            )
+        # Geçmiş batch'lerden maskmem token'larını negatif indekslerle inject et
+        self._inject_cross_batch_memory(inference_state)
+
+    # ── Cross-batch memory ────────────────────────────────────────────────────
+
+    def _save_batch_memory(self, inference_state, batch_len: int) -> None:
+        """Propagation bittikten sonra, reset_state'ten önce çağrılır.
+
+        Her objenin maskmem_features + maskmem_pos_enc tensorlarını CPU'ya taşır
+        ve sliding-window deque'ya ekler. En eski batch otomatik düşer.
+        """
+        if not hasattr(self, '_cross_batch_memory'):
+            self._cross_batch_memory = deque(maxlen=self.CROSS_BATCH_MEMORY_BATCHES)
+
+        obj_id_to_idx   = inference_state.get("obj_id_to_idx", {})
+        output_dict_per = inference_state.get("output_dict_per_obj", {})
+
+        obj_memories: Dict[int, Dict[int, dict]] = {}
+
+        for obj_id, obj_idx in obj_id_to_idx.items():
+            obj_out = output_dict_per.get(obj_idx)
+            if obj_out is None:
+                continue
+
+            frames_data: Dict[int, dict] = {}
+            for storage_key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                for frame_idx, out in obj_out.get(storage_key, {}).items():
+                    if frame_idx < 0:
+                        continue   # önceki batch'ten inject edilmiş — tekrar kaydetme
+                    maskmem = out.get("maskmem_features")
+                    if maskmem is None:
+                        continue
+                    pos_enc = out.get("maskmem_pos_enc")
+                    if pos_enc is None:
+                        continue
+                    frames_data[frame_idx] = {
+                        "maskmem_features": maskmem.cpu(),
+                        "maskmem_pos_enc":  [p.cpu() for p in pos_enc],
+                    }
+
+            if frames_data:
+                obj_memories[obj_id] = frames_data
+
+        if obj_memories:
+            self._cross_batch_memory.append({
+                "batch_len":   batch_len,
+                "obj_memories": obj_memories,
+            })
+            print(f"  [cross-batch] saved: {len(obj_memories)} obj, "
+                  f"{batch_len} frames — history={len(self._cross_batch_memory)}/"
+                  f"{self.CROSS_BATCH_MEMORY_BATCHES} batches")
+
+    def _inject_cross_batch_memory(self, inference_state) -> None:
+        """_continue_tracking sonunda çağrılır.
+
+        Deque'daki batch'leri yeniden eskiye doğru iter ederek maskmem token'larını
+        negatif frame indekslerine inject eder. SAM2'nin memory lookup'u negative
+        dict.get() çağrısıyla çalıştığından bunları otomatik okur.
+
+        İndeks kuralı (batch_size=15 örneği):
+          en yeni batch → -15..-1
+          bir önceki    → -30..-16
+          iki önceki    → -45..-31
+        """
+        if not hasattr(self, '_cross_batch_memory') or not self._cross_batch_memory:
+            return
+
+        obj_id_to_idx   = inference_state.get("obj_id_to_idx", {})
+        output_dict_per = inference_state.get("output_dict_per_obj", {})
+
+        injected_frames = 0
+        cumulative      = 0   # yeniden eskiye doğru biriken frame sayısı
+
+        for saved in reversed(self._cross_batch_memory):
+            batch_len    = saved["batch_len"]
+            obj_memories = saved["obj_memories"]
+
+            for obj_id, frames_data in obj_memories.items():
+                obj_idx = obj_id_to_idx.get(obj_id)
+                if obj_idx is None:
+                    continue   # bu batch'te artık takip edilmiyor
+
+                obj_out = output_dict_per.get(obj_idx)
+                if obj_out is None:
+                    continue
+
+                non_cond = obj_out["non_cond_frame_outputs"]
+
+                for local_idx, mem in frames_data.items():
+                    # local_idx=0 → en eski, local_idx=batch_len-1 → en yeni
+                    # en yeni frame -1'e denk gelmeli
+                    neg_idx = local_idx - (cumulative + batch_len)
+
+                    # CPU'da bırak — SAM2 _prepare_memory_conditioned_features
+                    # içinde .to(device) ile lazy yükler, aynı anda max 6 frame.
+                    non_cond[neg_idx] = {
+                        "maskmem_features": mem["maskmem_features"],
+                        "maskmem_pos_enc":  mem["maskmem_pos_enc"],
+                        "pred_masks": None,
+                        "obj_ptr":    None,
+                    }
+                    injected_frames += 1
+
+            cumulative += batch_len
+
+        if injected_frames:
+            print(f"  [cross-batch] injected {injected_frames} memory frames "
+                  f"from {len(self._cross_batch_memory)} past batch(es)")
 
     # ── Propagation ───────────────────────────────────────────────────────────
 
@@ -488,43 +591,24 @@ class SAM2PipelineMixin:
 
         import torch
 
-        def _run_pass(reverse: bool = False) -> None:
-            generator = self.predictor.propagate_in_video(
-                inference_state,
-                reverse=reverse,
-            )
+        for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
+            inference_state
+        ):
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
 
-            while True:
-                if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                    torch.compiler.cudagraph_mark_step_begin()
-                try:
-                    out_frame_idx, out_obj_ids, out_mask_logits = next(generator)
-                except StopIteration:
-                    break
+            score_maps: Dict[int, np.ndarray] = {}
+            for k, obj_id in enumerate(out_obj_ids):
+                score = out_mask_logits[k].cpu().numpy()
+                if score.ndim == 3:
+                    score = score[0]
+                score_maps[obj_id] = cv2.resize(
+                    score.astype(np.float32), (w_orig, h_orig)
+                )
 
-                score_maps: Dict[int, np.ndarray] = {}
-                for k, obj_id in enumerate(out_obj_ids):
-                    score = out_mask_logits[k].cpu().numpy()
-                    if score.ndim == 3:
-                        score = score[0]
-                    score_maps[obj_id] = cv2.resize(
-                        score.astype(np.float32), (w_orig, h_orig)
-                    )
-
-                frame_masks = self._resolve_mask_conflicts(score_maps)
-                frame_masks = self._remove_overlapping_masks(frame_masks)
-
-                # Forward pass ilk tercih; reverse pass yalnızca eksik objeleri doldursun.
-                if out_frame_idx not in batch_masks:
-                    batch_masks[out_frame_idx] = frame_masks
-                else:
-                    merged = batch_masks[out_frame_idx].copy()
-                    for obj_id, mask in frame_masks.items():
-                        merged.setdefault(obj_id, mask)
-                    batch_masks[out_frame_idx] = merged
-
-        _run_pass(reverse=False)
-        _run_pass(reverse=True)
+            frame_masks = self._resolve_mask_conflicts(score_maps)
+            frame_masks = self._remove_overlapping_masks(frame_masks)
+            batch_masks[out_frame_idx] = frame_masks
 
         for out_frame_idx in sorted(batch_masks.keys()):
             frame_masks = batch_masks[out_frame_idx]
@@ -558,7 +642,7 @@ class SAM2PipelineMixin:
         for i, obj_id in enumerate(obj_ids):
             mask = (best_idx == i) & valid_pixels
 
-            if mask.sum() <= self.MIN_MASK_AREA:
+            if not mask.any():
                 continue
 
             # ── Geometrik filtreler ──────────────────────────────────────────
@@ -588,9 +672,8 @@ class SAM2PipelineMixin:
     def _remove_overlapping_masks(
         self, masks: Dict[int, np.ndarray]
     ) -> Dict[int, np.ndarray]:
-        """Remove duplicate masks (IoU > 0.5), keeping the lower (older) ID."""
-        if len(masks) <= 1:
-            return masks
+        """Devre dışı — SAM2 maskelerine müdahale etme."""
+        return masks
 
         obj_ids   = list(masks.keys())
         to_remove: set = set()
@@ -610,121 +693,3 @@ class SAM2PipelineMixin:
 
         return masks
 
-    # ── Degradation detection ─────────────────────────────────────────────────
-
-    DEGRADATION_THRESHOLD     = 0.30   # mask alanı initial'in %30'undan düşükse degrade
-    REPROMPT_MAX_DIST_PX      = 100    # YOLO eşleşme mesafesi (piksel)
-
-    def _detect_degraded_objects(self) -> list:
-        """Mask alanı initial_area'nın %30'undan düşük olan objeleri degraded işaretle.
-
-        Returns:
-            Degraded olarak işaretlenen obj_id listesi.
-        """
-        degraded_ids = []
-
-        for obj_id, obj_data in self.tracked_objects.items():
-            initial = obj_data.get("initial_area")
-            mask    = obj_data.get("last_mask")
-
-            if initial is None or initial < self.MIN_MASK_AREA:
-                continue
-
-            if mask is None or int(mask.sum()) < self.MIN_MASK_AREA:
-                obj_data["degraded"] = True
-                degraded_ids.append(obj_id)
-                continue
-
-            current_area = int(mask.sum())
-            ratio = current_area / initial
-            if ratio < self.DEGRADATION_THRESHOLD:
-                obj_data["degraded"] = True
-                degraded_ids.append(obj_id)
-            else:
-                obj_data["degraded"] = False
-
-        return degraded_ids
-
-    # ── Re-prompting degraded objects ─────────────────────────────────────────
-
-    def _reprompt_degraded(
-        self,
-        inference_state,
-        degraded_ids: list,
-        frame: 'np.ndarray',
-        temp_dir: str,
-        h_ref: int,
-        w_ref: int,
-    ):
-        """Degraded objeler için YOLO detection ile taze point prompt oluştur.
-
-        Son bilinen mask centroid'ine en yakın YOLO detection eşleştirilir.
-        Eşleşme bulunamazsa eski mask ile devam edilir (fallback).
-        """
-        h_orig, w_orig = frame.shape[:2]
-        scale_x = w_ref / w_orig
-        scale_y = h_ref / h_orig
-
-        all_dets = self.yolo.detect(frame, confidence_threshold=self.PLAYER_MIN_CONF)
-        player_dets = [d for d in all_dets if d['class_id'] in self.PLAYER_CLASSES]
-
-        for obj_id in degraded_ids:
-            obj_data = self.tracked_objects[obj_id]
-            last_mask = obj_data.get("last_mask")
-
-            # Son bilinen centroid
-            if last_mask is not None and last_mask.sum() > 0:
-                ys, xs = np.where(last_mask)
-                last_cx, last_cy = float(xs.mean()), float(ys.mean())
-            else:
-                # Mask tamamen kayıp — fallback yok
-                print(f"  [re-prompt] ID {obj_id}: mask fully lost, skipping")
-                continue
-
-            # En yakın YOLO detection bul
-            best_det  = None
-            best_dist = float('inf')
-            for det in player_dets:
-                x1, y1, x2, y2 = det['bbox']
-                dcx, dcy = (x1 + x2) / 2, (y1 + y2) / 2
-                dist = ((dcx - last_cx) ** 2 + (dcy - last_cy) ** 2) ** 0.5
-                if dist < best_dist and dist < self.REPROMPT_MAX_DIST_PX:
-                    best_dist = dist
-                    best_det  = det
-
-            if best_det is not None:
-                x1, y1, x2, y2 = best_det['bbox']
-                pts, lbls = self._make_sam2_points(
-                    x1, y1, x2, y2, scale_x, scale_y
-                )
-                self.predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    points=pts,
-                    labels=lbls,
-                )
-                obj_data["degraded"]     = False
-                obj_data["initial_area"] = None   # yeni propagasyonda tekrar set edilecek
-                self._record_prompt(0, obj_id, best_det['bbox'], "reprompt")
-                print(f"  [re-prompt] ID {obj_id}: fresh YOLO point prompt "
-                      f"(dist={best_dist:.0f}px)")
-
-                # Bu detection'ı kullanılmış olarak çıkar
-                player_dets.remove(best_det)
-            else:
-                # Fallback: eski mask ile devam et
-                if last_mask is not None:
-                    mask_resized = cv2.resize(
-                        last_mask.astype(np.float32), (w_ref, h_ref)
-                    ) > 0.5
-                    self.predictor.add_new_mask(
-                        inference_state=inference_state,
-                        frame_idx=0,
-                        obj_id=obj_id,
-                        mask=mask_resized,
-                    )
-                    bbox = self._mask_to_bbox(last_mask)
-                    self._record_prompt(0, obj_id, bbox, "reprompt_fallback")
-                print(f"  [re-prompt] ID {obj_id}: no YOLO match, "
-                      f"using old mask (fallback)")

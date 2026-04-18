@@ -107,15 +107,13 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
     JERSEY_LOCK_VOTES         = 3
     JERSEY_SWAP_MAX_DIST_PX   = 140
     PLAYER_MIN_CONF           = 0.8
-    NEW_PROMPT_MIN_CONF       = 0.90
-    NEW_PROMPT_NMS_IOU        = 0.05
-    NEW_PROMPT_OVERLAP_EXISTING = 0.10
+    NEW_PROMPT_MIN_CONF       = 0.70
+    NEW_PROMPT_NMS_IOU        = 0.30
+    NEW_PROMPT_OVERLAP_EXISTING = 0.30
     REFEREE_MIN_CONF          = 0.85
     JERSEY_UPDATE_INTERVAL    = 3
     DETECTION_UPDATE_INTERVAL = 2
-    RECONCILE_INTERVAL        = 30
-    SAM2_MASK_LOGIT_THRESHOLD = 0.00
-    MIN_MASK_AREA             = 100
+    SAM2_MASK_LOGIT_THRESHOLD = 0.15
     MAX_MASK_AREA_RATIO       = 0.20   # mask frame alanının %20'sinden büyük olamaz
     MASK_MIN_ASPECT           = 0.30   # mask bbox H/W oranı — zemin segm. yatay (düşük) oyuncu dikey
     KEYPOINT_BORDER_MARGIN    = 30
@@ -124,6 +122,7 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
     KEYPOINT_STILL_FRAMES     = 5
     PLAYER_MIN_HEIGHT_PX      = 40
     PLAYER_MIN_AREA_PX        = 900
+    PLAYER_EDGE_MARGIN_PX     = 60   # bbox kenardan bu kadar px içeride olmalı (seed gating)
     PLAYER_FOOT_BAND_MARGIN   = 12
     MAX_TRACK_JUMP_PX         = 140
     MAX_TRACK_JUMP_SCALE      = 1.8
@@ -145,7 +144,7 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
 
     def __init__(
         self,
-        sam2_config: str = "configs/sam2.1/sam2.1_hiera_b+",
+        sam2_config: str = "configs/sam2.1/sam2.1_hiera_b+.yaml",
         sam2_checkpoint: str = "models/sam2.1_hiera_base_plus.pt",
         yolo_path: str = "models/yolo/best_detection.pt",
         device: str = "cuda",
@@ -298,9 +297,7 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
             last_good_bbox = self._mask_to_bbox(last_good_mask) if last_good_mask is not None else None
 
             reject_reason = None
-            if not self._is_valid_player_mask(mask, keypoints_xy, frame_shape):
-                reject_reason = "court-out"
-            elif last_good_centroid is not None:
+            if last_good_centroid is not None:
                 dx = centroid[0] - last_good_centroid[0]
                 dy = centroid[1] - last_good_centroid[1]
                 jump = float((dx * dx + dy * dy) ** 0.5)
@@ -333,7 +330,7 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
         abs_frame = self._current_batch_offset + local_frame_idx
         if bbox is not None:
             x1, y1, x2, y2 = [float(c) for c in bbox]
-            pt       = [round((x1 + x2) / 2, 1), round((y1 + y2) / 2, 1)]
+            pt       = [round((x1 + x2) / 2, 1), round(y1 + 0.55 * (y2 - y1), 1)]
             bbox_int = [int(x1), int(y1), int(x2), int(y2)]
         else:
             pt       = None
@@ -436,7 +433,8 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
             base = "/dev/shm" if os.path.exists("/dev/shm") else "."
             return f"{base}/sam2_tracker_{os.getpid()}_{suffix}"
 
-        temp_dirs = [_make_temp("a"), _make_temp("b")]
+        use_double_buffer = batch_size <= 60
+        temp_dirs = [_make_temp("a"), _make_temp("b")] if use_double_buffer else [_make_temp("a")]
         cur = 0   # aktif buffer index
 
         base, ext = os.path.splitext(output_path)
@@ -502,7 +500,7 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
 
                 # Mevcut batch temp_dir
                 temp_dir = temp_dirs[cur]
-                nxt      = 1 - cur   # karşı buffer
+                nxt      = 1 - cur if use_double_buffer else cur
 
                 # Arka plan: bir sonraki batch frame'lerini çek (GPU propagation sırasında)
                 # next_future burada planlanır; sonucu propagation bittikten sonra alınır.
@@ -539,10 +537,13 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
                 # ── Arka plan: bir sonraki batch frame'lerini çek ────────────
                 # GPU propagation başlamadan HEMEN önce başlatılır; disk I/O ile
                 # GPU işi örtüşür → batch arası bekleme ortadan kalkar.
-                next_future = self._executor.submit(
-                    self._extract_batch,
-                    cap, temp_dirs[nxt], batch_size, frame_skip
-                )
+                if use_double_buffer:
+                    next_future = self._executor.submit(
+                        self._extract_batch,
+                        cap, temp_dirs[nxt], batch_size, frame_skip
+                    )
+                else:
+                    next_future = None
 
                 # ── Pass 1: SAM2 propagation (uninterrupted GPU run) ─────────
                 with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16):
@@ -560,11 +561,8 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
                     else:
                         keypoints_xy, confidences, H = self._last_keypoints
 
-                    masks = self._apply_track_sanity_gating(masks, keypoints_xy, frame.shape[:2])
+                    # _apply_track_sanity_gating devre dışı
                     batch_masks[i] = masks
-
-                    if abs_idx % self.RECONCILE_INTERVAL == 0 and abs_idx > frame_idx:
-                        self._reconcile_masks(frame, masks)
 
                     if abs_idx % self.JERSEY_UPDATE_INTERVAL == 0:
                         # Jersey OCR sadece player (non-referee) maskeleri için
@@ -664,23 +662,31 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
                     break
 
                 self._smart_redetection(frames[-1], batch_masks.get(len(frames) - 1, {}))
-                degraded = self._detect_degraded_objects()
-                if degraded:
-                    print(f"  [degradation] {len(degraded)} object(s) marked degraded: {degraded}")
 
+                self._save_batch_memory(inference_state, len(frames))
                 self.predictor.reset_state(inference_state)
                 inference_state = None
                 frame_idx += len(frames)
 
                 # ── Bir sonraki batch sonucunu al ────────────────────────────
-                if next_future is not None:
-                    frames = next_future.result()
-                    next_future = None
-                    if not frames:
+                if use_double_buffer:
+                    if next_future is not None:
+                        frames = next_future.result()
+                        next_future = None
+                        if not frames:
+                            break
+                        cur = nxt   # buffer'ları değiştir
+                    else:
                         break
-                    cur = nxt   # buffer'ları değiştir
                 else:
-                    break
+                    if frame_idx < total_frames:
+                        frames = self._extract_batch(
+                            cap, temp_dir, batch_size, frame_skip=frame_skip
+                        )
+                        if not frames:
+                            break
+                    else:
+                        break
 
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -709,8 +715,9 @@ class RobustSAM2Tracker(CourtFilterMixin, SAM2PipelineMixin, PlayerDetectionMixi
                 except cv2.error:
                     pass
 
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            for temp_dir in temp_dirs:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
 
             self._executor.shutdown(wait=False)
             self._executor = ThreadPoolExecutor(max_workers=2)

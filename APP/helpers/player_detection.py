@@ -31,61 +31,6 @@ class PlayerDetectionMixin:
       self._is_valid_player_bbox(), self._bbox_to_mask()
     """
 
-    def _reconcile_masks(self, frame: np.ndarray, current_masks: Dict[int, np.ndarray]) -> None:
-        """Mark drifted tracks as degraded by comparing YOLO detections vs SAM2 masks."""
-        RECONCILE_IOU_THRESH  = 0.3
-        RECONCILE_DIST_THRESH = 50
-
-        all_detections = self.yolo.detect(
-            frame,
-            confidence_threshold=min(self.confidence_threshold, self.PLAYER_MIN_CONF),
-        )
-        player_detections = [
-            d for d in all_detections if d['class_id'] in self.PLAYER_CLASSES
-        ]
-        if not player_detections:
-            return
-
-        for det in player_detections:
-            x1, y1, x2, y2 = det['bbox']
-            det_cx, det_cy = (x1 + x2) / 2, (y1 + y2) / 2
-            det_mask_r = self._bbox_to_mask(det['bbox'], frame.shape[:2])
-
-            best_oid = None
-            best_mask = None
-            best_dist = float("inf")
-            for oid, obj in self.tracked_objects.items():
-                if obj.get("is_referee", False):
-                    continue
-                mask = current_masks.get(oid)
-                if mask is None:
-                    mask = obj.get("last_mask")
-                if mask is None or mask.sum() < self.MIN_MASK_AREA:
-                    continue
-
-                ys, xs = np.where(mask)
-                if len(xs) == 0:
-                    continue
-                mask_cx = float(xs.mean())
-                mask_cy = float(ys.mean())
-
-                center_dist = ((det_cx - mask_cx) ** 2 + (det_cy - mask_cy) ** 2) ** 0.5
-                if center_dist < best_dist:
-                    best_dist = center_dist
-                    best_oid = oid
-                    best_mask = mask
-
-            if best_oid is None or best_mask is None or best_dist >= RECONCILE_DIST_THRESH:
-                continue
-
-            iou = self._mask_iou(det_mask_r, best_mask)
-            if iou < RECONCILE_IOU_THRESH:
-                self.tracked_objects[best_oid]["degraded"] = True
-                print(
-                    f"  [reconcile] ID {best_oid}: mask drifted "
-                    f"(IoU={iou:.2f}, dist={best_dist:.0f}px)"
-                )
-
     @staticmethod
     def _mask_centroid(mask: np.ndarray) -> Optional[Tuple[float, float]]:
         ys, xs = np.where(mask)
@@ -460,11 +405,8 @@ class PlayerDetectionMixin:
                 "lost_count": 0,
                 "is_referee": False,
                 "initial_area": int(det_mask.sum()),
-                "degraded": False,
-            }
 
-        # Batch-end reconciliation: mark drifted tracks for next-batch re-prompt.
-        self._reconcile_masks(frame, current_masks)
+            }
 
         # ── Referee re-detection ──────────────────────────────────────────────
         ref_all_dets = self.yolo.detect(frame, confidence_threshold=self.REFEREE_MIN_CONF)
@@ -497,5 +439,5 @@ class PlayerDetectionMixin:
                 "lost_count": 0,
                 "is_referee": True,
                 "initial_area": int(det_mask.sum()),
-                "degraded": False,
+
             }

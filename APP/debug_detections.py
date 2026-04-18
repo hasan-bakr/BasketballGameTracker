@@ -153,14 +153,56 @@ def draw_detection(frame, det, court_reason: str, size_reason: str, show_all: bo
 
 
 
+def _edge_line(frame, px, py, dx, dy, color, thickness=2):
+    """(px,py) noktasından (dx,dy) yönünde frame kenarlarına kadar çizgi çiz."""
+    h, w = frame.shape[:2]
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return
+    pts = []
+    # Her 4 kenarla kesişim — parametre t = kenar mesafesi / yön
+    for t in [
+        -px / dx if abs(dx) > 1e-9 else None,
+        (w - 1 - px) / dx if abs(dx) > 1e-9 else None,
+        -py / dy if abs(dy) > 1e-9 else None,
+        (h - 1 - py) / dy if abs(dy) > 1e-9 else None,
+    ]:
+        if t is None:
+            continue
+        ix, iy = px + t * dx, py + t * dy
+        if -1 <= ix <= w and -1 <= iy <= h:
+            pts.append((int(ix), int(iy)))
+    if len(pts) >= 2:
+        pts.sort()
+        cv2.line(frame, pts[0], pts[-1], color, thickness, cv2.LINE_AA)
+
+
+def _rot_vec(dx, dy, deg):
+    """(dx,dy) vektörünü CCW deg derece döndür (standart math, image-y-down)."""
+    r = np.deg2rad(deg)
+    c, s = np.cos(r), np.sin(r)
+    return c * dx - s * dy, s * dx + c * dy
+
+
+def _edge_angle(pts):
+    """Nokta listesinden en uzak iki noktayı al, yön vektörü döndür (pozitif-x yönünde)."""
+    if len(pts) < 2:
+        return None
+    p0, p1 = pts[0], pts[-1]           # _vis_kp y'ye göre sıralar → p0=üst, p1=alt
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    mag = np.hypot(dx, dy)
+    if mag < 1e-6:
+        return None
+    return dx / mag, dy / mag           # "/" için: küçük+dx, büyük+dy (aşağı-sağ)
+
+
 def draw_boundary_lines(frame, keypoints_xy):
-    """Sol '/' ve sağ '\' sınır çizgilerini frame'e çiz."""
+    """Sol '/' ve sağ '\\' sınır çizgilerini frame'e çiz."""
     h, w = frame.shape[:2]
 
     def _pts(indices):
         return _vis_kp(keypoints_xy, indices)
 
-    # Sol sınır — sarı noktalı çizgi
+    # Sol sınır — sarı
     lpts = _pts(LEFT_KP)
     if len(lpts) >= 2:
         for i in range(len(lpts) - 1):
@@ -169,7 +211,7 @@ def draw_boundary_lines(frame, keypoints_xy):
                      (int(lpts[i+1][0]), int(lpts[i+1][1])),
                      (0, 220, 255), 2, cv2.LINE_AA)
 
-    # Sağ sınır — sarı noktalı çizgi
+    # Sağ sınır — sarı
     rpts = _pts(RIGHT_KP)
     if len(rpts) >= 2:
         for i in range(len(rpts) - 1):
@@ -178,19 +220,54 @@ def draw_boundary_lines(frame, keypoints_xy):
                      (int(rpts[i+1][0]), int(rpts[i+1][1])),
                      (0, 220, 255), 2, cv2.LINE_AA)
 
-    # Üst sınır — mavi yatay çizgi (min-y keypoint'te)
-    top_pts  = _pts(TOP_KP)
-    edge_pts = _pts([i for i in range(18) if i not in INNER_KP])
-    ref_top  = top_pts if top_pts else edge_pts
-    if ref_top:
-        top_y = int(min(p[1] for p in ref_top))
-        cv2.line(frame, (0, top_y), (w, top_y), (255, 80, 0), 2, cv2.LINE_AA)
+    # ── Üst sınır ────────────────────────────────────────────────────────────
+    top_pts = _pts(TOP_KP)
+    if len(top_pts) >= 2:
+        # 2+ nokta: doğrudan bağla ve uzat
+        p0, p1 = top_pts[0], top_pts[-1]
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        _edge_line(frame, p0[0], p0[1], dx, dy, (255, 80, 0))
+    elif len(top_pts) == 1:
+        px, py = top_pts[0]
+        # Hangi kenardan geliyor?
+        slash_vec  = _edge_angle(lpts)   # "/" yönü (üstten alta)
+        bslash_vec = _edge_angle(rpts)   # "\" yönü (üstten alta)
+        if slash_vec is not None:
+            dx, dy = _rot_vec(slash_vec[0], slash_vec[1], 120)
+        elif bslash_vec is not None:
+            dx, dy = _rot_vec(bslash_vec[0], bslash_vec[1], -120)
+        else:
+            dx, dy = 1.0, 0.0            # fallback: yatay
+        _edge_line(frame, px, py, dx, dy, (255, 80, 0))
+    else:
+        # Keypoint yok — en üst görünen noktadan yatay
+        edge_pts = _pts([i for i in range(18) if i not in INNER_KP])
+        if edge_pts:
+            top_y = int(min(p[1] for p in edge_pts))
+            cv2.line(frame, (0, top_y), (w, top_y), (255, 80, 0), 2, cv2.LINE_AA)
 
-    # Alt sınır — mavi yatay çizgi
+    # ── Alt sınır ────────────────────────────────────────────────────────────
     bot_pts = _pts(BOT_KP)
-    if bot_pts:
-        bot_y = int(max(p[1] for p in bot_pts))
-        cv2.line(frame, (0, bot_y), (w, bot_y), (255, 80, 0), 2, cv2.LINE_AA)
+    if len(bot_pts) >= 2:
+        p0, p1 = bot_pts[0], bot_pts[-1]
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        _edge_line(frame, p0[0], p0[1], dx, dy, (255, 80, 0))
+    elif len(bot_pts) == 1:
+        px, py = bot_pts[0]
+        slash_vec  = _edge_angle(lpts)
+        bslash_vec = _edge_angle(rpts)
+        if slash_vec is not None:
+            dx, dy = _rot_vec(slash_vec[0], slash_vec[1], 60)
+        elif bslash_vec is not None:
+            dx, dy = _rot_vec(bslash_vec[0], bslash_vec[1], -60)
+        else:
+            dx, dy = 1.0, 0.0
+        _edge_line(frame, px, py, dx, dy, (255, 80, 0))
+    else:
+        bot_y_candidates = _pts([i for i in range(18) if i not in INNER_KP])
+        if bot_y_candidates:
+            bot_y = int(max(p[1] for p in bot_y_candidates))
+            cv2.line(frame, (0, bot_y), (w, bot_y), (255, 80, 0), 2, cv2.LINE_AA)
 
     return frame
 

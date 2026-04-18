@@ -6,11 +6,27 @@ Usage:
 
 import argparse
 import contextlib
+import logging
 import os
 import sys
 import traceback
+import warnings
 
-from APP.helpers.robust_sam2_tracker import RobustSAM2Tracker
+
+_SUPPRESSED_TORCH_WARNING = "Not enough SMs to use max_autotune_gemm mode"
+
+
+class _SuppressTorchInductorWarning(logging.Filter):
+    def filter(self, record):
+        return _SUPPRESSED_TORCH_WARNING not in record.getMessage()
+
+
+def _configure_torch_warning_suppression():
+    warnings.filterwarnings("ignore", message=f".*{_SUPPRESSED_TORCH_WARNING}.*")
+    warning_filter = _SuppressTorchInductorWarning()
+    for logger_name in ("torch", "torch._inductor", "torch._inductor.utils"):
+        logger = logging.getLogger(logger_name)
+        logger.addFilter(warning_filter)
 
 
 class _ProgressBarStderr:
@@ -119,6 +135,9 @@ def main():
     parser.add_argument("--debug-prompts", action="store_true",
                         help="Overlay prompt events on output video and save _prompt_events.json")
     args = parser.parse_args()
+    _configure_torch_warning_suppression()
+
+    from APP.helpers.robust_sam2_tracker import RobustSAM2Tracker
 
     output_dir = os.path.dirname(os.path.abspath(args.output)) or os.getcwd()
     log_file = os.path.abspath(args.log_file) if args.log_file else os.path.join(output_dir, "log.txt")

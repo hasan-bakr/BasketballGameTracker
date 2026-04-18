@@ -117,6 +117,7 @@ def draw_keypoints_on_frame(
             label = name
         cv2.putText(frame, label, (x + 12, y - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
     return frame
 
 
