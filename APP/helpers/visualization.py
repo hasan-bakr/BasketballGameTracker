@@ -1,12 +1,68 @@
 """
 Visualization Helpers
 =====================
-Standalone drawing utilities for mask overlays and player annotations.
+Standalone drawing utilities for BotSort tracks and mask overlays.
 """
 
 import cv2
 import numpy as np
 from typing import Dict, List, Optional, Set
+
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def draw_tracks_with_ids(
+    frame: np.ndarray,
+    tracks: list,
+    colors: List[tuple],
+    jersey_bank,
+) -> np.ndarray:
+    """Draw a dot at player feet + floating badge above. Jersey-locked tracks get a halo."""
+    result = frame.copy()
+
+    for track in tracks:
+        x1, y1, x2, y2 = track["bbox"]
+        tid    = track["track_id"]
+        is_ref = track["is_referee"]
+
+        fx = (x1 + x2) // 2
+        fy = y2
+        bbox_h = max(1, y2 - y1)
+        dot_r  = max(5, min(10, bbox_h // 12))
+
+        if is_ref:
+            color  = (0, 200, 255)
+            jersey = None
+            label  = "REF"
+        else:
+            color  = colors[tid % len(colors)]
+            jersey = jersey_bank.get_jersey(tid)
+            label  = f"#{jersey}" if jersey else str(tid)
+
+        # Foot dot
+        if jersey:
+            cv2.circle(result, (fx, fy), dot_r + 4, color, 2, cv2.LINE_AA)
+        cv2.circle(result, (fx, fy), dot_r, color, -1, cv2.LINE_AA)
+        cv2.circle(result, (fx, fy), dot_r, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Floating badge above head
+        font_scale = 0.75 if jersey else 0.55
+        thickness  = 2 if jersey else 1
+        font       = cv2.FONT_HERSHEY_DUPLEX if jersey else FONT
+        (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+        pad = 5
+        lx  = fx - tw // 2
+        ly  = y1 - pad * 2
+        bx1, by1 = lx - pad, max(ly - th - pad, 0)
+        bx2, by2 = lx + tw + pad, max(ly + pad // 2, 0)
+
+        cv2.rectangle(result, (bx1, by1), (bx2, by2), color, -1)
+        if jersey:
+            cv2.rectangle(result, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+        cv2.putText(result, label, (lx, ly), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    return result
 
 
 def _make_stripe_pattern(h: int, w: int, stripe_width: int = 8) -> np.ndarray:

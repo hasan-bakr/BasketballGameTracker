@@ -8,7 +8,7 @@ for tactical bird's-eye view projection.
 import os
 import cv2
 import numpy as np
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # ── Project root ─────────────────────────────────────────────────────────────
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,7 +59,7 @@ KP_NAMES = [
 ]
 
 # ── Default model / asset paths ───────────────────────────────────────────────
-DEFAULT_KEYPOINT_MODEL = os.path.join(ROOT_DIR, "models", "keypoints", "test_keypoint.pt")
+DEFAULT_KEYPOINT_MODEL = os.path.join(ROOT_DIR, "models", "keypoints", "yolo26l-fine-tuned.pt")
 DEFAULT_COURT_IMAGE = os.path.join(ROOT_DIR, "APP", "assets", "basketball_court.png")
 
 
@@ -126,7 +126,8 @@ def draw_tactical_view(
     keypoints_xy: np.ndarray,
     H: Optional[np.ndarray],
     player_feet: Optional[List[List[float]]] = None,
-    player_jerseys: Optional[List[Optional[str]]] = None
+    player_jerseys: Optional[List[Optional[str]]] = None,
+    position_history: Optional[Dict[int, object]] = None,
 ) -> np.ndarray:
     """Render a bird's-eye tactical view by projecting keypoints and player
     positions through the homography matrix onto the court template image.
@@ -165,6 +166,26 @@ def draw_tactical_view(
             color = KP_COLORS[i] if i < len(KP_COLORS) else (0, 255, 0)
             cv2.circle(tactical, (draw_x, draw_y), 5, color, -1)
             cv2.circle(tactical, (draw_x, draw_y), 6, (255, 255, 255), 1)
+
+    # Draw movement trails
+    if position_history and H is not None:
+        for history in position_history.values():
+            pts = []
+            for foot in history:
+                src = np.array([[foot]], dtype=np.float32)
+                try:
+                    dst = cv2.perspectiveTransform(src, H)
+                    px, py = int(dst[0][0][0]), int(dst[0][0][1])
+                    if 0 <= px < TACTICAL_WIDTH and 0 <= py < TACTICAL_HEIGHT:
+                        pts.append((px, py))
+                except Exception:
+                    continue
+            n = len(pts)
+            if n >= 2:
+                for i in range(1, n):
+                    alpha = i / n
+                    intensity = int(60 + 195 * alpha)
+                    cv2.line(tactical, pts[i - 1], pts[i], (0, intensity, intensity), 1, cv2.LINE_AA)
 
     # Draw player positions
     if player_feet:

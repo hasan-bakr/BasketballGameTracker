@@ -52,6 +52,14 @@ basketball_analysis/
 court_analysis_ref/
 parseq/
 sn-calibration/
+tools/
+applied plans/
+
+# Local planning / scratch docs
+exampt_label.txt
+
+# Secrets
+.env
 
 # Personal notes
 sunum_notlari.txt

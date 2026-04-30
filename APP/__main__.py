@@ -1,4 +1,4 @@
-"""Basketball Game Tracker — CLI entry point.
+"""Basketball Game Tracker — CLI entry point (BotSort pipeline).
 
 Usage:
     python -m APP --input videos/input/game.mp4 --output videos/output/result.mp4
@@ -11,92 +11,63 @@ import os
 import sys
 import traceback
 import warnings
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+except ImportError:
+    pass  # python-dotenv yoksa .env yüklenmez, env var elle set edilmeli
 
 
-_SUPPRESSED_TORCH_WARNING = "Not enough SMs to use max_autotune_gemm mode"
+_SUPPRESSED = "Not enough SMs to use max_autotune_gemm mode"
 
 
-class _SuppressTorchInductorWarning(logging.Filter):
+class _SuppressTorchWarning(logging.Filter):
     def filter(self, record):
-        return _SUPPRESSED_TORCH_WARNING not in record.getMessage()
+        return _SUPPRESSED not in record.getMessage()
 
 
-def _configure_torch_warning_suppression():
-    warnings.filterwarnings("ignore", message=f".*{_SUPPRESSED_TORCH_WARNING}.*")
-    warning_filter = _SuppressTorchInductorWarning()
-    for logger_name in ("torch", "torch._inductor", "torch._inductor.utils"):
-        logger = logging.getLogger(logger_name)
-        logger.addFilter(warning_filter)
-
-
-class _ProgressBarStderr:
-    """Write everything to log, but mirror only the SAM2 tqdm bar to the terminal."""
-
-    def __init__(self, log_fp, terminal_fp):
-        self.log_fp = log_fp
-        self.terminal_fp = terminal_fp
-        self._mirror_active = False
-        self._suppress_terminal_tokens = (
-            "Not enough SMs to use max_autotune_gemm mode",
-        )
-
-    def write(self, text):
-        self.log_fp.write(text)
-
-        is_progress_chunk = "propagate in video" in text
-        is_progress_update = self._mirror_active and ("\r" in text or "%" in text)
-        is_suppressed = any(token in text for token in self._suppress_terminal_tokens)
-
-        if not is_suppressed and (is_progress_chunk or is_progress_update):
-            self.terminal_fp.write(text)
-            self.terminal_fp.flush()
-            self._mirror_active = not text.endswith("\n")
-
-        return len(text)
-
-    def flush(self):
-        self.log_fp.flush()
-        self.terminal_fp.flush()
-
-    def isatty(self):
-        return self.terminal_fp.isatty()
+def _configure_warnings():
+    warnings.filterwarnings("ignore", message=f".*{_SUPPRESSED}.*")
+    flt = _SuppressTorchWarning()
+    for name in ("torch", "torch._inductor", "torch._inductor.utils"):
+        logging.getLogger(name).addFilter(flt)
 
 
 class _StdoutMirror:
-    """Write stdout to log and selectively mirror key run info to terminal."""
+    """Tee stdout to log file; mirror key progress lines to terminal."""
+
+    _MIRROR = (
+        "Run metadata:",
+        "Output files:",
+        "Done! Output:",
+        "Tactical:",
+        "Homography success:",
+    )
 
     def __init__(self, log_fp, terminal_fp):
-        self.log_fp = log_fp
+        self.log_fp      = log_fp
         self.terminal_fp = terminal_fp
-        self._buffer = ""
-        self._mirror_prefixes = (
-            "Run metadata:",
-            "Output files:",
-            "Batch: processed frames",
-            "Done! Output:",
-            "Tactical:",
-            "Objects tracked:",
-            "Homography success:",
-        )
+        self._buf        = ""
 
-    def _emit_line(self, line):
-        stripped = line.strip()
-        if any(stripped.startswith(prefix) for prefix in self._mirror_prefixes):
+    def _emit(self, line):
+        if any(line.strip().startswith(p) for p in self._MIRROR):
             self.terminal_fp.write(line)
             self.terminal_fp.flush()
 
     def write(self, text):
         self.log_fp.write(text)
-        self._buffer += text
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            self._emit_line(line + "\n")
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._emit(line + "\n")
         return len(text)
 
     def flush(self):
-        if self._buffer:
-            self._emit_line(self._buffer)
-            self._buffer = ""
+        if self._buf:
+            self._emit(self._buf)
+            self._buf = ""
         self.log_fp.flush()
         self.terminal_fp.flush()
 
@@ -106,78 +77,62 @@ class _StdoutMirror:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Basketball Game Tracker: player segmentation, jersey OCR, tactical view."
+        description="Basketball Game Tracker: player tracking, jersey OCR, tactical view."
     )
-    parser.add_argument("--input", "-i", required=True,
-                        help="Path to input video file")
-    parser.add_argument("--output", "-o", required=True,
-                        help="Path for annotated output video")
-    parser.add_argument("--max-frames", type=int, default=300,
-                        help="Maximum frames to process (default: 300)")
-    parser.add_argument("--start", type=float, default=0.0,
-                        help="Start time in seconds (default: 0)")
-    parser.add_argument("--batch-size", type=int, default=150,
-                        help="Frames per SAM2 propagation batch (default: 150)")
-    parser.add_argument("--confidence", type=float, default=0.5,
-                        help="YOLO detection confidence threshold (default: 0.5)")
-    parser.add_argument("--device", default="cuda",
-                        help="Compute device: cuda or cpu (default: cuda)")
-    parser.add_argument("--sam2-checkpoint", default="models/sam2.1_hiera_base_plus.pt",
-                        help="Path to SAM2 checkpoint .pt file")
-    parser.add_argument("--yolo-model", default="models/yolo/best_detection.pt",
-                        help="Path to YOLO detection model (.pt or .onnx)")
-    parser.add_argument("--no-amp", action="store_true",
-                        help="Disable automatic mixed precision (FP16)")
-    parser.add_argument("--frame-skip", type=int, default=1,
-                        help="Process 1 out of every N frames (default: 1 = all frames)")
-    parser.add_argument("--log-file", default=None,
-                        help="Path to verbose run log (default: output_dir/log.txt)")
-    parser.add_argument("--debug-prompts", action="store_true",
-                        help="Overlay prompt events on output video and save _prompt_events.json")
+    parser.add_argument("--input",      "-i", required=True,  help="Input video path")
+    parser.add_argument("--output",     "-o", required=True,  help="Annotated output video path")
+    parser.add_argument("--max-frames", type=int,   default=300,  help="Max frames to process (default: 300)")
+    parser.add_argument("--start",      type=float, default=0.8,  help="Start time in seconds (default: 0)")
+    parser.add_argument("--confidence",      type=float, default=0.4,  help="Detection confidence threshold (default: 0.4)")
+    parser.add_argument("--device",          default="cuda",            help="Compute device (default: cuda)")
+    parser.add_argument("--rfdetr-model-id", default="basketball-player-detection-3-ycjdo/4",
+                        help="Roboflow RF-DETR model ID for player/referee detection")
+    parser.add_argument("--yolo-model",      default=None,
+                        help="YOLO model path for jersey number detection (optional)")
+    parser.add_argument("--frame-skip", type=int,   default=1,    help="Process 1 of every N frames (default: 1)")
+    parser.add_argument("--log-file",   default=None,              help="Verbose log path (default: output_dir/log.txt)")
     args = parser.parse_args()
-    _configure_torch_warning_suppression()
 
-    from APP.helpers.robust_sam2_tracker import RobustSAM2Tracker
+    _configure_warnings()
+
+    from APP.helpers.botsort_pipeline import BotSortPipeline
 
     output_dir = os.path.dirname(os.path.abspath(args.output)) or os.getcwd()
-    log_file = os.path.abspath(args.log_file) if args.log_file else os.path.join(output_dir, "log.txt")
-    base, ext = os.path.splitext(args.output)
-    tactical_output = f"{base}_tactical{ext}"
+    log_file   = os.path.abspath(args.log_file) if args.log_file else os.path.join(output_dir, "log.txt")
+    base, ext  = os.path.splitext(args.output)
+    tactical   = f"{base}_tactical{ext}"
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
-    print(f"Running tracker. Detailed logs: {log_file}", flush=True)
+    print(f"Running tracker. Logs: {log_file}", flush=True)
 
     with open(log_file, "w", encoding="utf-8") as log_fp:
-        log_fp.write("Basketball Game Tracker verbose log\n")
-        log_fp.write("log_mode=truncate_on_start\n")
-        log_fp.write(f"input={args.input}\n")
-        log_fp.write(f"output={args.output}\n")
-        log_fp.write(f"output_tactical={tactical_output}\n")
-        log_fp.write(f"log_file={log_file}\n")
-        log_fp.write(f"device={args.device}\n")
-        log_fp.write(f"batch_size={args.batch_size}\n")
-        log_fp.write(f"frame_skip={args.frame_skip}\n\n")
+        for line in (
+            "Basketball Game Tracker verbose log\n",
+            f"input={args.input}\n",
+            f"output={args.output}\n",
+            f"tactical={tactical}\n",
+            f"device={args.device}\n",
+            f"frame_skip={args.frame_skip}\n\n",
+        ):
+            log_fp.write(line)
         log_fp.flush()
-        stdout_mirror = _StdoutMirror(log_fp, sys.__stdout__)
-        progress_stderr = _ProgressBarStderr(log_fp, sys.__stderr__)
+
+        mirror = _StdoutMirror(log_fp, sys.__stdout__)
 
         try:
-            with contextlib.redirect_stdout(stdout_mirror), contextlib.redirect_stderr(progress_stderr):
-                tracker = RobustSAM2Tracker(
-                    sam2_checkpoint=args.sam2_checkpoint,
+            with contextlib.redirect_stdout(mirror):
+                tracker = BotSortPipeline(
+                    rfdetr_model_id=args.rfdetr_model_id,
                     yolo_path=args.yolo_model,
                     device=args.device,
                     confidence_threshold=args.confidence,
-                    use_amp=not args.no_amp,
                 )
                 tracker.process_video(
                     args.input,
                     args.output,
                     max_frames=args.max_frames,
-                    batch_size=args.batch_size,
                     start_sec=args.start,
                     frame_skip=args.frame_skip,
-                    debug_prompts=args.debug_prompts,
                 )
         except Exception:
             traceback.print_exc(file=log_fp)
@@ -185,7 +140,7 @@ def main():
             print(f"Run failed. Check log: {log_file}", file=sys.stderr, flush=True)
             raise
 
-    print(f"Run complete. Log saved to {log_file}", flush=True)
+    print(f"Run complete. Log: {log_file}", flush=True)
 
 
 if __name__ == "__main__":
