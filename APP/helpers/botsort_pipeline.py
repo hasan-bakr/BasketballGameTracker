@@ -4,8 +4,8 @@ botsort_pipeline.py
 End-to-end basketball tracking pipeline.
 
   - RF-DETR detection (players, referees)
-  - BotSort multi-object tracking
-  - Jersey number OCR via PARSeq (optional YOLO model for jersey boxes)
+    - BotSort multi-object tracking
+    - Jersey number OCR via PARSeq (RF-DETR class=2 jersey boxes)
   - Court keypoint detection + RANSAC homography
   - Supervision-based visualization
   - Tactical bird's-eye view
@@ -26,20 +26,8 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 sys.path.append(ROOT_DIR)
 
 from APP.helpers.rfdetr_detector import RFDETRDetector
-from APP.helpers.yolo_detector import YoloDetector
 from APP.helpers.botsort_tracker import BotSortTracker
 from APP.helpers.memory_reid import MemoryReIDMatcher
-
-
-class _NoOpJerseyBank:
-    """Stub used when jersey OCR is disabled (no YOLO model provided)."""
-    def __init__(self):
-        self.obj_to_jersey    = {}
-        self.detection_counts = {}
-    def get_jersey(self, tid):
-        return None
-    def register(self, tid, number):
-        pass
 from APP.helpers.court_utils import (
     TACTICAL_WIDTH, TACTICAL_HEIGHT, TACTICAL_KEYPOINTS,
     DEFAULT_KEYPOINT_MODEL, DEFAULT_COURT_IMAGE,
@@ -105,11 +93,11 @@ class BotSortPipeline:
     # ── Class IDs (match RFDETRDetector / BotSortTracker) ─────────────────────
     PLAYER_CLASSES = [3, 4, 5, 6, 7]
     REFEREE_CLASS  = 8
-    NUMBER_CLASS   = 2  # jersey numbers (YOLO-only)
+    NUMBER_CLASS   = 2  # jersey numbers (RF-DETR class=2)
 
     # ── Thresholds & intervals ─────────────────────────────────────────────────
     PLAYER_MIN_CONF      = 0.4
-    REFEREE_MIN_CONF     = 0.4
+    REFEREE_MIN_CONF     = 0.3
     JERSEY_MIN_CONF      = 0.4
     JERSEY_MIN_SIZE      = 10
     JERSEY_EXPAND        = 1.5
@@ -117,6 +105,31 @@ class BotSortPipeline:
     JERSEY_UPDATE_INT    = 3
     KEYPOINT_UPDATE_INT  = 2
     TRAIL_LENGTH         = 30
+    MEM_W_APP            = 0.80
+    MEM_W_GIOU           = 0.15
+    MEM_W_KALMAN         = 0.02
+    MEM_SIM_THRESH       = 0.45
+    MEM_TTL              = 90
+    MEM_EMA_ALPHA        = 0.7
+    MEM_BANK_BLEND       = 0.7
+    MEM_GATE_SCALE       = 6.0
+    STABLE_REID_THRESH   = 0.92
+    STABLE_REID_TTL      = 180
+    STABLE_REID_SPATIAL_MIN = 120.0
+    STABLE_REID_SPATIAL_MAX = 360.0
+    STABLE_REID_SPATIAL_DIAG = 3.0
+    DETECTOR_IOU_THRESH  = 0.6
+    DET_NMS_IOU          = 0.65
+    CROSS_ROLE_IOU       = 0.80
+    TRACK_NMS_IOU        = 0.88
+    ID_DEBUG_EVERY_FRAME = True
+    ID_JUMP_PX           = 90.0
+    ID_SWAP_PX           = 70.0
+    RAW_SWITCH_JUMP_PX   = 90.0
+    RAW_SWITCH_COOLDOWN  = 12
+    RESURRECT_DIST_PX    = 250.0
+    SPLIT_IOU_THRESH     = 0.4
+    SPLIT_SIM_THRESH     = 0.85
 
     # ── Keypoint filtering ─────────────────────────────────────────────────────
     KEYPOINT_BORDER_MARGIN   = 30
@@ -133,7 +146,6 @@ class BotSortPipeline:
     def __init__(
         self,
         rfdetr_model_id: str = RFDETRDetector.DEFAULT_MODEL_ID,
-        yolo_path: str = None,
         device: str = "cuda",
         confidence_threshold: float = 0.4,
         keypoint_model_path: str = None,
@@ -146,35 +158,67 @@ class BotSortPipeline:
         # Primary detector: RF-DETR for players / referees
         self.player_detector = RFDETRDetector(model_id=rfdetr_model_id, device=device)
 
-        # Optional secondary detector: YOLO for jersey number boxes (class 2)
-        self.jersey_yolo     = None
-        self.jersey_detector = None
-        self.jersey_bank     = None
-        if yolo_path and os.path.exists(yolo_path):
-            from APP.helpers.jersey_detector import JerseyDetector, JerseyReIDBank
-            self.jersey_yolo     = YoloDetector(model_path=yolo_path, device=device)
-            self.jersey_detector = JerseyDetector(device=device)
-            self.jersey_bank     = JerseyReIDBank()
-            print(f"  Jersey YOLO: {yolo_path}")
-        else:
-            self.jersey_bank = _NoOpJerseyBank()
-            print("  Jersey YOLO: not provided, jersey OCR disabled.")
+        # Jersey OCR: use RF-DETR class=2 number boxes + PARSeq
+        from APP.helpers.jersey_detector import JerseyDetector, JerseyReIDBank
+        self.jersey_detector = JerseyDetector(device=device)
+        self.jersey_bank     = JerseyReIDBank()
+        print("  Jersey OCR: RF-DETR class=2 + PARSeq")
 
         self.tracker = BotSortTracker(
             device=device,
-            with_reid=False,   # memory_reid handles appearance, osnet disabled
-            match_thresh=0.6,
-            track_buffer=60,
+            with_reid=False,
+            match_thresh=0.85,
+            track_buffer=90,
             fuse_first_associate=True,
             asso_func="giou",
             appearance_thresh=0.35,
+            memory_ttl=self.MEM_TTL,
+            memory_ema_alpha=self.MEM_EMA_ALPHA,
+            w_app=self.MEM_W_APP,
+            w_giou=self.MEM_W_GIOU,
+            w_kalman=self.MEM_W_KALMAN,
+            similarity_threshold=self.MEM_SIM_THRESH,
+            bank_blend=self.MEM_BANK_BLEND,
+            kalman_gate_scale=self.MEM_GATE_SCALE,
+            kalman_only_position=True,
         )
         self.memory_reid = MemoryReIDMatcher(
             device=device,
-            similarity_threshold=0.72,
-            ghost_ttl=180,
-            ema_alpha=0.45,
-            min_frames_before_match=12,
+            similarity_threshold=self.STABLE_REID_THRESH,
+            ghost_ttl=self.STABLE_REID_TTL,
+            ema_alpha=self.MEM_EMA_ALPHA,
+            min_frames_before_match=0,
+            extractor=self.tracker.embedding_extractor,
+            ghost_only_for_new=True,
+            spatial_gate_min=self.STABLE_REID_SPATIAL_MIN,
+            spatial_gate_max=self.STABLE_REID_SPATIAL_MAX,
+            spatial_gate_diag_mult=self.STABLE_REID_SPATIAL_DIAG,
+            raw_switch_jump_thresh=self.RAW_SWITCH_JUMP_PX,
+            raw_switch_cooldown=self.RAW_SWITCH_COOLDOWN,
+            resurrect_dist_thresh=self.RESURRECT_DIST_PX,
+            split_iou_thresh=self.SPLIT_IOU_THRESH,
+            split_sim_thresh=self.SPLIT_SIM_THRESH,
+        )
+        print(
+            "  Tracking tuning: "
+            f"match_thresh=0.85 track_buffer=90 "
+            f"w_app={self.MEM_W_APP:.2f} w_giou={self.MEM_W_GIOU:.2f} "
+            f"w_kalman={self.MEM_W_KALMAN:.2f} "
+            f"gate_scale={self.MEM_GATE_SCALE:.1f} kalman_only_position=True "
+            f"stable_reid_thresh={self.STABLE_REID_THRESH:.2f} "
+            f"stable_reid_ttl={self.STABLE_REID_TTL} ghost_only_for_new=True "
+            f"stable_spatial=({self.STABLE_REID_SPATIAL_MIN:.0f},"
+            f"{self.STABLE_REID_SPATIAL_MAX:.0f},"
+            f"{self.STABLE_REID_SPATIAL_DIAG:.1f}) "
+            f"id_debug={int(self.ID_DEBUG_EVERY_FRAME)} "
+            f"id_jump_px={self.ID_JUMP_PX:.0f} "
+            f"id_swap_px={self.ID_SWAP_PX:.0f} "
+            f"raw_switch_jump_px={self.RAW_SWITCH_JUMP_PX:.0f} "
+            f"raw_switch_cooldown={self.RAW_SWITCH_COOLDOWN} "
+            f"resurrect_dist_px={self.RESURRECT_DIST_PX:.0f} "
+            f"det_nms_iou={self.DET_NMS_IOU:.2f} "
+            f"split_iou={self.SPLIT_IOU_THRESH:.2f} "
+            f"split_sim={self.SPLIT_SIM_THRESH:.2f}"
         )
 
         kp_path = keypoint_model_path or DEFAULT_KEYPOINT_MODEL
@@ -199,6 +243,8 @@ class BotSortPipeline:
         self._keypoint_stationary_counts = np.zeros(18, dtype=np.int32)
 
         self.locked_jersey_ids: set = set()
+        self._prev_id_debug: Dict[int, Dict] = {}
+        self._prev_raw_to_stable_debug: Dict[int, int] = {}
 
         # ── Supervision annotators ─────────────────────────────────────────────
         self._player_palette = _make_sv_palette(60)
@@ -398,20 +444,165 @@ class BotSortPipeline:
 
         return True
 
+    @staticmethod
+    def _bbox_iou(a: List[int], b: List[int]) -> float:
+        ax1, ay1, ax2, ay2 = [float(v) for v in a]
+        bx1, by1, bx2, by2 = [float(v) for v in b]
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+        return inter / (area_a + area_b - inter)
+
+    def _dedupe_target_detections(self, dets: List[Dict]) -> List[Dict]:
+        """Suppress near-duplicate player/referee detections before tracking."""
+        target_classes = set(self.PLAYER_CLASSES + [self.REFEREE_CLASS])
+        target = [d for d in dets if d["class_id"] in target_classes]
+        other = [d for d in dets if d["class_id"] not in target_classes]
+        target.sort(key=lambda d: float(d["confidence"]), reverse=True)
+
+        kept: List[Dict] = []
+        for det in target:
+            is_ref = det["class_id"] == self.REFEREE_CLASS
+            keep = True
+            for prev in kept:
+                prev_is_ref = prev["class_id"] == self.REFEREE_CLASS
+                iou = self._bbox_iou(det["bbox"], prev["bbox"])
+                if is_ref == prev_is_ref and iou >= self.DET_NMS_IOU:
+                    keep = False
+                    break
+                if is_ref != prev_is_ref and iou >= self.CROSS_ROLE_IOU:
+                    keep = False
+                    break
+            if keep:
+                kept.append(det)
+        return kept + other
+
+    def _dedupe_tracks(self, tracks: List[Dict]) -> List[Dict]:
+        """Remove overlapping duplicate tracks and role-conflict overlays."""
+        if not tracks:
+            return tracks
+        ordered = sorted(tracks, key=lambda t: float(t.get("confidence", 0.0)), reverse=True)
+        kept: List[Dict] = []
+        for tr in ordered:
+            keep = True
+            for prev in kept:
+                iou = self._bbox_iou(tr["bbox"], prev["bbox"])
+                if tr["is_referee"] == prev["is_referee"] and iou >= self.TRACK_NMS_IOU:
+                    keep = False
+                    break
+                if tr["is_referee"] != prev["is_referee"] and iou >= self.CROSS_ROLE_IOU:
+                    keep = False
+                    break
+            if keep:
+                kept.append(tr)
+        return kept
+
+    @staticmethod
+    def _bbox_center_xy(bbox: List[int]) -> Tuple[float, float]:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        return (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+    @staticmethod
+    def _point_dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+    def _log_id_debug(self, tracks: List[Dict], frame_idx: int) -> None:
+        """Frame-level ID diagnostics for raw/stable mapping and possible swaps."""
+        player_tracks = [t for t in tracks if not t.get("is_referee", False)]
+        current: Dict[int, Dict] = {}
+        current_raw_to_stable: Dict[int, int] = {}
+
+        for tr in sorted(player_tracks, key=lambda t: int(t.get("track_id", -1))):
+            sid = int(tr.get("stable_track_id", tr.get("track_id", -1)))
+            rid = int(tr.get("raw_track_id", tr.get("track_id", sid)))
+            cx, cy = self._bbox_center_xy(tr["bbox"])
+            current[sid] = {
+                "raw": rid,
+                "bbox": tr["bbox"],
+                "center": (cx, cy),
+                "conf": float(tr.get("confidence", 0.0)),
+            }
+            current_raw_to_stable[rid] = sid
+
+            prev_raw_sid = self._prev_raw_to_stable_debug.get(rid)
+            if prev_raw_sid is not None and prev_raw_sid != sid:
+                print(
+                    f"    [id-map-change] frame={frame_idx} "
+                    f"raw={rid} stable_old={prev_raw_sid} stable_new={sid}"
+                )
+
+            prev = self._prev_id_debug.get(sid)
+            if prev is not None:
+                jump = self._point_dist(prev["center"], (cx, cy))
+                raw_changed = int(prev["raw"]) != rid
+                if raw_changed or jump >= self.ID_JUMP_PX:
+                    print(
+                        f"    [id-track] frame={frame_idx} stable={sid} raw={rid} "
+                        f"prev_raw={int(prev['raw'])} cx={cx:.1f} cy={cy:.1f} "
+                        f"jump={jump:.1f} raw_changed={int(raw_changed)} "
+                        f"bbox={tr['bbox']}"
+                    )
+            else:
+                print(
+                    f"    [id-new] frame={frame_idx} stable={sid} raw={rid} "
+                    f"cx={cx:.1f} cy={cy:.1f} bbox={tr['bbox']}"
+                )
+
+        prev_ids = set(self._prev_id_debug.keys())
+        current_ids = set(current.keys())
+        for sid in sorted(prev_ids - current_ids):
+            prev = self._prev_id_debug[sid]
+            px, py = prev["center"]
+            print(
+                f"    [id-lost] frame={frame_idx} stable={sid} raw={int(prev['raw'])} "
+                f"last_cx={px:.1f} last_cy={py:.1f}"
+            )
+
+        for sid_a in sorted(prev_ids & current_ids):
+            prev_a = self._prev_id_debug[sid_a]
+            cur_a = current[sid_a]
+            for sid_b in sorted((prev_ids & current_ids) - {sid_a}):
+                if sid_b <= sid_a:
+                    continue
+                prev_b = self._prev_id_debug[sid_b]
+                cur_b = current[sid_b]
+                cross_ab = self._point_dist(prev_a["center"], cur_b["center"])
+                cross_ba = self._point_dist(prev_b["center"], cur_a["center"])
+                self_a = self._point_dist(prev_a["center"], cur_a["center"])
+                self_b = self._point_dist(prev_b["center"], cur_b["center"])
+                if (
+                    cross_ab + cross_ba + self.ID_SWAP_PX
+                    < self_a + self_b
+                ):
+                    print(
+                        f"    [possible-swap] frame={frame_idx} "
+                        f"a={sid_a} raw_a={int(cur_a['raw'])} "
+                        f"b={sid_b} raw_b={int(cur_b['raw'])} "
+                        f"self=({self_a:.1f},{self_b:.1f}) "
+                        f"cross=({cross_ab:.1f},{cross_ba:.1f})"
+                    )
+
+        self._prev_id_debug = current
+        self._prev_raw_to_stable_debug = current_raw_to_stable
+
     # ── Jersey OCR ────────────────────────────────────────────────────────────
 
-    def _detect_jerseys(self, frame: np.ndarray, tracks: List[Dict]) -> None:
-        if self.jersey_yolo is None or self.jersey_detector is None:
+    def _detect_jerseys(self, frame: np.ndarray, tracks: List[Dict], dets: List[Dict]) -> None:
+        if self.jersey_detector is None:
             return
         h, w = frame.shape[:2]
         player_tracks = {t["track_id"]: t for t in tracks if not t["is_referee"]}
         if not player_tracks:
             return
 
-        det_results = self.jersey_yolo.detect(frame, confidence_threshold=self.JERSEY_MIN_CONF)
         number_boxes = [
-            d for d in det_results
+            d for d in dets
             if d["class_id"] == self.NUMBER_CLASS
+            and float(d.get("confidence", 0.0)) >= self.JERSEY_MIN_CONF
             and (d["bbox"][2] - d["bbox"][0]) >= self.JERSEY_MIN_SIZE
             and (d["bbox"][3] - d["bbox"][1]) >= self.JERSEY_MIN_SIZE
         ]
@@ -581,7 +772,9 @@ class BotSortPipeline:
                     break
 
                 dets = self.player_detector.detect(
-                    frame, confidence_threshold=self.confidence_threshold
+                    frame,
+                    confidence_threshold=self.confidence_threshold,
+                    iou_threshold=self.DETECTOR_IOU_THRESH,
                 )
 
                 if frame_idx % self.KEYPOINT_UPDATE_INT == 0:
@@ -595,12 +788,42 @@ class BotSortPipeline:
                     if d["class_id"] not in self.PLAYER_CLASSES
                     or self._is_valid_player_bbox(d["bbox"], kp_xy, frame.shape[:2])
                 ]
+                filtered_dets = self._dedupe_target_detections(filtered_dets)
 
                 tracks = self.tracker.update(filtered_dets, frame)
                 tracks = self.memory_reid.update(tracks, frame, frame_idx)
+                reid_frame_dbg = self.memory_reid.get_debug_summary()
+                if (
+                    reid_frame_dbg.get("remapped", 0.0) > 0
+                    and reid_frame_dbg.get("ghost_matches", 0.0) > 0
+                ):
+                    print(
+                        f"    [stable-reid-event] frame={frame_idx} "
+                        f"new_raw={int(reid_frame_dbg.get('new_raw', 0))} "
+                        f"ghost_match={int(reid_frame_dbg.get('ghost_matches', 0))} "
+                        f"remap={int(reid_frame_dbg.get('remapped', 0))} "
+                        f"max_ghost_sim={float(reid_frame_dbg.get('max_ghost_sim', 0.0)):.3f} "
+                        f"ghost_spatial_rej={int(reid_frame_dbg.get('ghost_spatial_rejects', 0))} "
+                        f"ghosts={int(reid_frame_dbg.get('ghosts', 0))}"
+                    )
+                if reid_frame_dbg.get("switch_blocks", 0.0) > 0:
+                    print(
+                        f"    [raw-switch-block] frame={frame_idx} "
+                        f"blocks={int(reid_frame_dbg.get('switch_blocks', 0))} "
+                        f"tracks={int(reid_frame_dbg.get('tracks', 0))}"
+                    )
+                if reid_frame_dbg.get("fresh_allocs", 0.0) > 0:
+                    print(
+                        f"    [fresh-alloc] frame={frame_idx} "
+                        f"count={int(reid_frame_dbg.get('fresh_allocs', 0))} "
+                        f"resurrect={int(reid_frame_dbg.get('resurrect_blocks', 0))}"
+                    )
+                tracks = self._dedupe_tracks(tracks)
+                if self.ID_DEBUG_EVERY_FRAME:
+                    self._log_id_debug(tracks, frame_idx)
 
                 if frame_idx % self.JERSEY_UPDATE_INT == 0 and tracks:
-                    self._detect_jerseys(frame, tracks)
+                    self._detect_jerseys(frame, tracks, dets)
 
                 src_idx = start_frame + frame_idx * frame_skip
                 result  = self._annotate_frame(frame, tracks, kp_xy, kp_conf, H, frame_idx, src_idx)
@@ -637,6 +860,71 @@ class BotSortPipeline:
                 n_kp = int((kp_xy > 0).all(axis=1).sum())
                 if frame_idx % 30 == 0:
                     print(f"  frame {frame_idx:4d}  tracks={len(tracks):2d}  kp={n_kp}/18  jersey={len(self.jersey_bank.obj_to_jersey)}")
+                    dbg = self.tracker.get_debug_summary()
+                    p = dbg.get("player", {})
+                    r = dbg.get("referee", {})
+                    reid_dbg = self.memory_reid.get_debug_summary()
+                    if p:
+                        p_pairs = float(p.get("pairs", 0.0))
+                        p_gate_pct = 100.0 * float(p.get("gate_blocked", 0.0)) / p_pairs if p_pairs else 0.0
+                        p_finite_pct = 100.0 * float(p.get("finite_pairs", 0.0)) / p_pairs if p_pairs else 0.0
+                        print(
+                            "    [assoc-player] "
+                            f"pairs={int(p.get('pairs', 0))} "
+                            f"gate={int(p.get('gate_blocked', 0))} "
+                            f"gate_pct={p_gate_pct:.1f} "
+                            f"app_pen={int(p.get('app_penalty', 0))} "
+                            f"finite={int(p.get('finite_pairs', 0))} "
+                            f"finite_pct={p_finite_pct:.1f} "
+                            f"matches={int(p.get('matches', 0))} "
+                            f"u_t={int(p.get('u_track', 0))} "
+                            f"u_d={int(p.get('u_det', 0))} "
+                            f"m_app={float(p.get('match_app', 0.0)):.3f} "
+                            f"m_giou={float(p.get('match_giou', 0.0)):.3f} "
+                            f"m_motion={float(p.get('match_motion', 0.0)):.3f} "
+                            f"m_cost={float(p.get('match_cost', 0.0)):.3f}"
+                        )
+                    if reid_dbg:
+                        print(
+                            "    [stable-reid]  "
+                            f"tracks={int(reid_dbg.get('tracks', 0))} "
+                            f"new_raw={int(reid_dbg.get('new_raw', 0))} "
+                            f"locked={int(reid_dbg.get('locked', 0))} "
+                            f"eligible={int(reid_dbg.get('eligible', 0))} "
+                            f"cand={int(reid_dbg.get('candidates', 0))} "
+                            f"remap={int(reid_dbg.get('remapped', 0))} "
+                            f"ghost_match={int(reid_dbg.get('ghost_matches', 0))} "
+                            f"ghost_cand={int(reid_dbg.get('ghost_candidates', 0))} "
+                            f"ghost_spatial_rej={int(reid_dbg.get('ghost_spatial_rejects', 0))} "
+                            f"switch_blocks={int(reid_dbg.get('switch_blocks', 0))} "
+                            f"fresh_allocs={int(reid_dbg.get('fresh_allocs', 0))} "
+                            f"resurrect_blocks={int(reid_dbg.get('resurrect_blocks', 0))} "
+                            f"split_drops={int(reid_dbg.get('split_drops', 0))} "
+                            f"max_sim={float(reid_dbg.get('max_match_sim', 0.0)):.3f} "
+                            f"max_ghost_sim={float(reid_dbg.get('max_ghost_sim', 0.0)):.3f} "
+                            f"active_bank={int(reid_dbg.get('active_bank', 0))} "
+                            f"ghosts={int(reid_dbg.get('ghosts', 0))}"
+                        )
+                    if r:
+                        r_pairs = float(r.get("pairs", 0.0))
+                        r_gate_pct = 100.0 * float(r.get("gate_blocked", 0.0)) / r_pairs if r_pairs else 0.0
+                        r_finite_pct = 100.0 * float(r.get("finite_pairs", 0.0)) / r_pairs if r_pairs else 0.0
+                        print(
+                            "    [assoc-ref]    "
+                            f"pairs={int(r.get('pairs', 0))} "
+                            f"gate={int(r.get('gate_blocked', 0))} "
+                            f"gate_pct={r_gate_pct:.1f} "
+                            f"app_pen={int(r.get('app_penalty', 0))} "
+                            f"finite={int(r.get('finite_pairs', 0))} "
+                            f"finite_pct={r_finite_pct:.1f} "
+                            f"matches={int(r.get('matches', 0))} "
+                            f"u_t={int(r.get('u_track', 0))} "
+                            f"u_d={int(r.get('u_det', 0))} "
+                            f"m_app={float(r.get('match_app', 0.0)):.3f} "
+                            f"m_giou={float(r.get('match_giou', 0.0)):.3f} "
+                            f"m_motion={float(r.get('match_motion', 0.0)):.3f} "
+                            f"m_cost={float(r.get('match_cost', 0.0)):.3f}"
+                        )
 
                 frame_idx += 1
 

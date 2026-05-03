@@ -87,8 +87,6 @@ def main():
     parser.add_argument("--device",          default="cuda",            help="Compute device (default: cuda)")
     parser.add_argument("--rfdetr-model-id", default="basketball-player-detection-3-ycjdo/4",
                         help="Roboflow RF-DETR model ID for player/referee detection")
-    parser.add_argument("--yolo-model",      default=None,
-                        help="YOLO model path for jersey number detection (optional)")
     parser.add_argument("--frame-skip", type=int,   default=1,    help="Process 1 of every N frames (default: 1)")
     parser.add_argument("--log-file",   default=None,              help="Verbose log path (default: output_dir/log.txt)")
     args = parser.parse_args()
@@ -123,7 +121,6 @@ def main():
             with contextlib.redirect_stdout(mirror):
                 tracker = BotSortPipeline(
                     rfdetr_model_id=args.rfdetr_model_id,
-                    yolo_path=args.yolo_model,
                     device=args.device,
                     confidence_threshold=args.confidence,
                 )

@@ -39,10 +39,10 @@ from APP.helpers.court_utils   import (
 # ── Tracker sabitleri (robust_sam2_tracker.py ile senkron) ────────────────────
 PLAYER_CLASSES       = {3, 4, 5, 6, 7}
 REFEREE_CLASS        = 8
-PLAYER_MIN_CONF      = 0.8
-REFEREE_MIN_CONF     = 0.85
+PLAYER_MIN_CONF      = 0.7
+REFEREE_MIN_CONF     = 0.9
 PLAYER_MIN_HEIGHT_PX = 40
-PLAYER_MIN_AREA_PX   = 900
+PLAYER_MIN_AREA_PX   = 300
 KEYPOINT_BORDER_MARGIN = 30
 CLUSTER_TRIGGER_COUNT   = 3
 CLUSTER_MIN_SPREAD_PX   = 100
