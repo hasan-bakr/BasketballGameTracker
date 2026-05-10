@@ -1,6 +1,4 @@
-"""
-RF-DETR player detector via Roboflow Inference SDK.
-Drop-in replacement for YoloDetector in the BotSort pipeline.
+"""RF-DETR detector via Roboflow Inference SDK.
 
 Requires:
   pip install inference-gpu
@@ -13,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-# Maps RF-DETR class names → pipeline class IDs (must match BotSortTracker)
+# Maps RF-DETR class names → pipeline class IDs (must match MCByte tracker wrapper)
 _NAME_TO_CID: Dict[str, int] = {
     "player":     3,
     "referee":    8,
@@ -65,7 +63,7 @@ def _resolve_class_id(name: str, raw_id: Any) -> int:
 class RFDETRDetector:
     """Roboflow Inference RF-DETR wrapper.
 
-    Returns the same dict-list format as YoloDetector.detect():
+    Returns the normalized detection format used by the pipeline:
         [{'bbox': [x1,y1,x2,y2], 'confidence': float,
           'class_name': str, 'class_id': int}]
     """

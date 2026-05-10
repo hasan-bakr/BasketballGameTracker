@@ -1,142 +1,153 @@
 # Basketball Game Tracker
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![PyTorch](https://img.shields.io/badge/PyTorch-Deep%20Learning-red)
-![RF--DETR](https://img.shields.io/badge/RF--DETR-Detection-orange)
-![BoT--SORT](https://img.shields.io/badge/BoT--SORT-Tracking-purple)
-![Status](https://img.shields.io/badge/Status-In%20Development-yellow)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Status](https://img.shields.io/badge/Status-Active-brightgreen)
 
-Computer-vision pipeline for basketball footage analysis:
-- player/referee detection
-- multi-object tracking with stable IDs
-- optional jersey OCR
-- court homography and tactical bird's-eye view
+A computer vision pipeline for basketball footage analysis. Detects and tracks players and referees across frames with MCByte mask-assisted association, reads jersey numbers, and projects positions onto a 2D tactical court map.
 
-## Current Pipeline
+---
 
-```text
-Input Video
-   ->
-RF-DETR (players, referees, optional ball/rim classes)
-   ->
-BoT-SORT tracking (player/referee trackers separated)
-   ->
-Memory ReID (DINOv2 embedding bank, ID stabilization)
-   ->
-Jersey OCR (optional YOLO jersey boxes + PARSeq)
-   ->
-Court keypoints + homography
-   ->
-Annotated video + tactical view video
+## Demo
+
+**Tracking view**
+
+![Tracking demo](videos/demo_tracking.gif)
+
+**Tactical bird's-eye view**
+
+![Tactical demo](videos/demo_tactical.gif)
+
+---
+
+## Pipeline
+
 ```
+Input Video
+    ↓
+RF-DETR  ──  player / referee / jersey detection
+    ↓
+MCByte  ──  multi-object tracking with mask-assisted association
+    ↓
+Jersey OCR (optional)  ──  YOLO jersey crops → PARSeq number reading
+    ↓
+Court keypoints + RANSAC homography
+    ↓
+Annotated video  +  Tactical view video
+```
+
+---
 
 ## Features
 
 | Feature | Status |
 |---|---|
-| Player/referee detection (RF-DETR) | ✅ |
-| Multi-object tracking (BoT-SORT) | ✅ |
-| Memory-bank ReID stabilization (DINOv2) | ✅ |
-| Jersey OCR (optional PARSeq flow) | ✅ |
-| Court keypoint detection + homography | ✅ |
-| Tactical bird's-eye projection | ✅ |
-| Speed / distance analytics | 🔲 |
+| Player / referee detection (RF-DETR) | Done |
+| Multi-object tracking (MCByte) | Done |
+| Mask-assisted identity association (SAM + Cutie) | Done |
+| Jersey number OCR (PARSeq) | Done |
+| Court keypoint detection (fine-tuned YOLO-Pose) | Done |
+| RANSAC homography + tactical projection | Done |
+| Speed / distance analytics | Planned |
+
+---
 
 ## Project Structure
 
-```text
+```
 APP/
-├── __main__.py                    # CLI entry point: python -m APP
+├── __main__.py              # CLI entry point: python -m APP
 ├── assets/
 │   └── basketball_court.png
 └── helpers/
-    ├── botsort_pipeline.py        # End-to-end pipeline
-    ├── botsort_tracker.py         # BoT-SORT wrapper
-    ├── rfdetr_detector.py         # Roboflow RF-DETR wrapper
-    ├── memory_reid.py             # DINOv2 memory-bank ReID
-    ├── yolo_detector.py           # Optional jersey-box detector
-    ├── jersey_detector.py         # PARSeq OCR + jersey bank
-    ├── court_utils.py             # Keypoints, homography, tactical view
-    ├── team_detector.py           # Team-color helper
-    └── visualization.py           # Drawing helpers
+    ├── config.py            # Central pipeline configuration
+    ├── pipeline.py          # End-to-end pipeline orchestration
+    ├── mcbyte_tracker.py    # MCByte wrapper
+    ├── rfdetr_detector.py   # RF-DETR detection via Roboflow Inference
+    ├── jersey_detector.py   # PARSeq OCR + jersey number bank
+    ├── court_utils.py       # Keypoints, homography, tactical drawing
+    └── team_detector.py     # Team-color classifier
 ```
+
+---
 
 ## Setup
 
-### Requirements
-
-- Python 3.11+
-- CUDA-capable GPU (recommended)
-- Conda (recommended)
+**Requirements:** Python 3.11+, CUDA-capable GPU (recommended), Conda
 
 ```bash
-git clone https://github.com/hasan-bakr/BasketballGameTracker.git
-cd BasketballGameTracker
+git clone https://github.com/hasan-bakr/Basketball-Game-Tracker.git
+cd Basketball-Game-Tracker
 
-conda create -n dsci python=3.11 -y
-conda activate dsci
+conda create -n bgt python=3.11 -y
+conda activate bgt
 
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
 
-### Required Environment Variable
-
-RF-DETR runs via Roboflow Inference SDK:
+**RF-DETR runs via the Roboflow Inference SDK. Set your API key:**
 
 ```bash
 export ROBOFLOW_API_KEY="your_key_here"
 ```
 
-If `inference-gpu` is missing:
+If the GPU inference package is missing:
 
 ```bash
 pip uninstall inference -y
 pip install inference-gpu
 ```
 
-### Model Assets
+**Required model asset:**
 
-- `models/keypoints/yolo26l-fine-tuned.pt` (court keypoint model)
-- Optional jersey detector model for `--yolo-model`
+- `models/keypoints/yolo26l-fine-tuned.pt` — fine-tuned YOLO-Pose court keypoint model
+
+---
 
 ## Run
 
 ```bash
 python -m APP \
-  --input videos/input/game.mp4 \
+  --input  videos/input/game.mp4 \
   --output videos/output/result.mp4 \
   --device cuda
 ```
 
-### CLI Options
+### CLI Reference
 
-```text
---input / -i               Input video path (required)
---output / -o              Annotated output path (required)
---max-frames               Frames to process (default: 300)
---start                    Start time in seconds (default: 0.8)
---confidence               Detection threshold (default: 0.4)
---device                   cuda or cpu (default: cuda)
---rfdetr-model-id          Roboflow RF-DETR model ID
---yolo-model               Optional YOLO model path (jersey boxes)
---frame-skip               Process 1 frame out of N (default: 1)
---log-file                 Verbose run log path
-```
+| Flag | Default | Description |
+|---|---|---|
+| `--input` / `-i` | required | Input video path |
+| `--output` / `-o` | required | Annotated output video path |
+| `--max-frames` | 300 | Number of frames to process |
+| `--start` | 0.8 | Start offset in seconds |
+| `--confidence` | 0.4 | Detection confidence threshold |
+| `--device` | cuda | `cuda` or `cpu` |
+| `--rfdetr-model-id` | see below | Roboflow RF-DETR model ID |
+| `--frame-skip` | 1 | Process 1 out of every N frames |
+| `--log-file` | auto | Verbose log path |
 
-## Outputs
-
-One run produces:
-- `result.mp4` (annotated source view)
-- `result_tactical.mp4` (2D tactical projection)
-- `log.txt` (verbose run metadata and frame stats)
+Default model ID: `basketball-player-detection-3-ycjdo/4`
 
 ---
 
-## Proje Özeti (Türkçe)
+## Outputs
 
-Bu proje basketbol videosundan oyuncu/hakem tespiti, takip, ID stabilizasyonu,
-opsiyonel forma numarası OCR ve taktik görünüm üretir.
+Each run produces three files:
 
-Ana akış:
-**RF-DETR -> BoT-SORT -> DINOv2 memory bank ReID -> homografi -> taktik harita**.
+| File | Contents |
+|---|---|
+| `result.mp4` | Annotated source-view video |
+| `result_tactical.mp4` | 2D tactical projection video |
+| `log.txt` | Frame-level stats and run metadata |
+
+---
+
+## Branches
+
+| Branch | Description |
+|---|---|
+| `main` | Current pipeline: RF-DETR + MCByte + SAM/Cutie masks |
+| `sam2tracker` | Earlier experiment: SAM2-based instance tracking |

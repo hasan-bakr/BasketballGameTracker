@@ -8,6 +8,7 @@
 .idea/
 .vscode/
 .cursor/
+.codex/
 pyrightconfig.json
 
 # Model weights (büyük dosyalar)
@@ -33,6 +34,9 @@ videos/output/*
 *.png
 *.gif
 !README.md
+!videos/demo_tracking.gif
+!videos/demo_tactical.gif
+!APP/assets/basketball_court.png
 
 # YAML configs (model configs)
 *.yaml
@@ -45,6 +49,7 @@ temp_*/
 trt_cache/
 
 # External repos / submodules (local reference copies)
+external/mcbyte/
 sam2-hiera-base-plus-onnx/
 rf-detr-onnx/
 HRNet-Human-Pose-Estimation/

@@ -217,7 +217,9 @@ class JerseyReIDBank:
     Jersey numaralarına göre oyuncu Re-ID bankası.
     """
     
-    def __init__(self):
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+
         # {obj_id: jersey_number}
         self.obj_to_jersey: Dict[int, str] = {}
         
@@ -259,7 +261,8 @@ class JerseyReIDBank:
                 self.obj_to_jersey[obj_id] = best_number
                 self.jersey_to_obj[best_number] = obj_id
 
-                print(f"   Jersey registered: ID {obj_id} → #{best_number}")
+                if self.verbose:
+                    print(f"   Jersey registered: ID {obj_id} → #{best_number}")
     
     def find_by_jersey(self, jersey_number: str) -> Optional[int]:
         """

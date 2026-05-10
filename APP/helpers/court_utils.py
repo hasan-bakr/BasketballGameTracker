@@ -7,6 +7,7 @@ for tactical bird's-eye view projection.
 
 import os
 import cv2
+import colorsys
 import numpy as np
 from typing import Dict, List, Optional
 
@@ -64,6 +65,18 @@ DEFAULT_COURT_IMAGE = os.path.join(ROOT_DIR, "APP", "assets", "basketball_court.
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
+
+def _track_color_bgr(track_id: int) -> tuple:
+    h = ((int(track_id) % 60) * 0.618033988749895) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.85, 0.95)
+    return int(b * 255), int(g * 255), int(r * 255)
+
+
+def _clamp_point(x: float, y: float, width: int, height: int) -> tuple:
+    return (
+        int(np.clip(round(x), 0, width - 1)),
+        int(np.clip(round(y), 0, height - 1)),
+    )
 
 def compute_homography(keypoints_xy: np.ndarray) -> Optional[np.ndarray]:
     """Compute a RANSAC homography matrix from detected court keypoints.
@@ -125,9 +138,12 @@ def draw_tactical_view(
     court_img: np.ndarray,
     keypoints_xy: np.ndarray,
     H: Optional[np.ndarray],
+    player_ids: Optional[List[int]] = None,
     player_feet: Optional[List[List[float]]] = None,
     player_jerseys: Optional[List[Optional[str]]] = None,
     position_history: Optional[Dict[int, object]] = None,
+    point_radius: int = 4,
+    trail_thickness: int = 2,
 ) -> np.ndarray:
     """Render a bird's-eye tactical view by projecting keypoints and player
     positions through the homography matrix onto the court template image.
@@ -136,6 +152,7 @@ def draw_tactical_view(
         court_img: Base court image (300x161 by default).
         keypoints_xy: (18, 2) detected keypoint positions.
         H: 3x3 homography matrix (camera → court). None → return plain court.
+        player_ids: Track IDs aligned with player_feet.
         player_feet: List of [x, y] foot positions in camera frame.
         player_jerseys: Jersey number strings aligned with player_feet.
 
@@ -167,25 +184,17 @@ def draw_tactical_view(
             cv2.circle(tactical, (draw_x, draw_y), 5, color, -1)
             cv2.circle(tactical, (draw_x, draw_y), 6, (255, 255, 255), 1)
 
-    # Draw movement trails
-    if position_history and H is not None:
-        for history in position_history.values():
-            pts = []
-            for foot in history:
-                src = np.array([[foot]], dtype=np.float32)
-                try:
-                    dst = cv2.perspectiveTransform(src, H)
-                    px, py = int(dst[0][0][0]), int(dst[0][0][1])
-                    if 0 <= px < TACTICAL_WIDTH and 0 <= py < TACTICAL_HEIGHT:
-                        pts.append((px, py))
-                except Exception:
-                    continue
+    # Draw movement trails. History is already projected and smoothed.
+    if position_history:
+        for track_id, history in position_history.items():
+            pts = [_clamp_point(pt[0], pt[1], TACTICAL_WIDTH, TACTICAL_HEIGHT) for pt in history]
             n = len(pts)
             if n >= 2:
+                color = _track_color_bgr(int(track_id))
                 for i in range(1, n):
                     alpha = i / n
-                    intensity = int(60 + 195 * alpha)
-                    cv2.line(tactical, pts[i - 1], pts[i], (0, intensity, intensity), 1, cv2.LINE_AA)
+                    blended = tuple(int(c * (0.25 + 0.75 * alpha)) for c in color)
+                    cv2.line(tactical, pts[i - 1], pts[i], blended, trail_thickness, cv2.LINE_AA)
 
     # Draw player positions
     if player_feet:
@@ -193,14 +202,16 @@ def draw_tactical_view(
             src_pt = np.array([[foot_pt]], dtype=np.float32)
             try:
                 dst_pt = cv2.perspectiveTransform(src_pt, H)
-                px, py = int(dst_pt[0][0][0]), int(dst_pt[0][0][1])
-                if 0 <= px < TACTICAL_WIDTH and 0 <= py < TACTICAL_HEIGHT:
-                    cv2.circle(tactical, (px, py), 6, (255, 255, 255), -1)
-                    cv2.circle(tactical, (px, py), 7, (0, 0, 0), 2)
-                    if player_jerseys and idx < len(player_jerseys) and player_jerseys[idx]:
-                        cv2.putText(tactical, player_jerseys[idx],
-                                    (px + 8, py + 4), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.35, (255, 255, 255), 1)
+                px, py = _clamp_point(dst_pt[0][0][0], dst_pt[0][0][1], TACTICAL_WIDTH, TACTICAL_HEIGHT)
+                track_id = player_ids[idx] if player_ids and idx < len(player_ids) else idx
+                color = _track_color_bgr(int(track_id))
+                cv2.circle(tactical, (px, py), point_radius + 1, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(tactical, (px, py), point_radius, color, -1, cv2.LINE_AA)
+                cv2.circle(tactical, (px, py), point_radius + 2, color, 1, cv2.LINE_AA)
+                if player_jerseys and idx < len(player_jerseys) and player_jerseys[idx]:
+                    cv2.putText(tactical, player_jerseys[idx],
+                                (px + point_radius + 4, py + 3), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.28, color, 1, cv2.LINE_AA)
             except Exception:
                 pass
 
