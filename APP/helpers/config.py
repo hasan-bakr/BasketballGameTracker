@@ -19,7 +19,7 @@ class ClassConfig:
 class DetectorConfig:
     rfdetr_model_id: str = RFDETRDetector.DEFAULT_MODEL_ID
     confidence: float = 0.3
-    iou_threshold: float = 0.4
+    iou_threshold: float = 0.8
     detection_nms_iou: float = 0.65
     cross_role_iou: float = 0.80
     track_nms_iou: float = 0.88
@@ -62,6 +62,20 @@ class TrackerConfig:
     cutie_max_internal_size: int = 720
     switch_proxy_max_dist: float = 80.0
     switch_proxy_max_dt: int = 60
+    switch_proxy_min_source_life: int = 10
+    duplicate_new_track_max_age: int = 5
+    duplicate_existing_min_age: int = 8
+    duplicate_new_track_iou: float = 0.85
+    duplicate_new_track_center_px: float = 45.0
+    mask_reinit_missing_frames: int = 6
+    mask_reinit_area_fail_frames: int = 4
+    mask_reinit_inside_fail_frames: int = 10
+    mask_reinit_inside_ratio: float = 0.12
+    mask_reinit_cooldown: int = 20
+    mask_assignment_near_iou: float = 0.08
+    mask_assignment_min_center_px: float = 55.0
+    mask_assignment_center_scale: float = 0.30
+    mask_reuse_min_fill: float = 0.35
 
 
 @dataclass
@@ -77,15 +91,23 @@ class JerseyConfig:
 class KeypointConfig:
     model_path: Optional[str] = DEFAULT_KEYPOINT_MODEL
     court_image_path: Optional[str] = DEFAULT_COURT_IMAGE
-    confidence: float = 0.3
+    confidence: float = 0.2
+    geometry_confidence: float = 0.25
     update_interval: int = 2
     border_margin: int = 30
     edge_band_ratio: float = 0.30
     still_px: float = 6.0
-    still_frames: int = 5
-    carry_missing_updates: int = 3
+    still_frames: int = 45
+    carry_missing_updates: int = 45
+    homography_min_update_keypoints: int = 6
+    homography_max_mean_shift: float = 35.0
+    homography_max_point_shift: float = 80.0
+    side_switch_min_keypoints: int = 3
+    side_switch_margin: int = 2
+    center_switch_min_keypoints: int = 1
     left_indices: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5])
     right_indices: List[int] = field(default_factory=lambda: [10, 11, 12, 13, 14, 15])
+    center_indices: List[int] = field(default_factory=lambda: [6, 7])
     top_indices: List[int] = field(default_factory=lambda: [0, 7, 15])
     bottom_indices: List[int] = field(default_factory=lambda: [5, 6, 10])
 
@@ -105,9 +127,10 @@ class DebugConfig:
 
 @dataclass
 class VisualizationConfig:
-    trail_length: int = 30
+    trail_length: int = 0
     tactical_trail_length: int = 18
-    tactical_smoothing: float = 0.65
+    tactical_smoothing: float = 0.78
+    tactical_max_step_px: float = 25.0
     tactical_point_radius: int = 4
     tactical_trail_thickness: int = 2
     draw_masks: bool = True

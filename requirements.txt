@@ -2,6 +2,7 @@ torch>=2.0
 torchvision
 ultralytics>=8.0
 opencv-python>=4.8
+supervision
 numpy
 scipy
 tqdm
@@ -15,3 +16,6 @@ h5py
 hydra-core
 omegaconf
 segment-anything
+inference-gpu
+python-dotenv
+Pillow

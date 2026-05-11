@@ -9,6 +9,10 @@
 .vscode/
 .cursor/
 .codex/
+.claude/
+.agents/
+CLAUDE.md
+.claudeignore
 pyrightconfig.json
 
 # Model weights (büyük dosyalar)
@@ -27,26 +31,36 @@ datasets/
 videos/input/*
 videos/output/*
 *.mp4
+*.mov
+*.avi
+*.mkv
 
-# Images (output/test)
+# Images / media outputs
 *.jpg
 *.jpeg
 *.png
 *.gif
 !README.md
-!videos/demo_tracking.gif
-!videos/demo_tactical.gif
 !APP/assets/basketball_court.png
+!media/
+!media/*.gif
+!media/*.jpg
+!media/*.jpeg
+!media/*.png
 
 # YAML configs (model configs)
 *.yaml
 
 # Training outputs
 runs/
+wandb/
+outputs/
 
 # Temp directories
 temp_*/
 trt_cache/
+LOG.log
+*.log
 
 # External repos / submodules (local reference copies)
 external/mcbyte/

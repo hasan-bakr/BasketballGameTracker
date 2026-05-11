@@ -199,11 +199,15 @@ def draw_tactical_view(
     # Draw player positions
     if player_feet:
         for idx, foot_pt in enumerate(player_feet):
-            src_pt = np.array([[foot_pt]], dtype=np.float32)
+            track_id = player_ids[idx] if player_ids and idx < len(player_ids) else idx
+            history = position_history.get(int(track_id)) if position_history else None
             try:
-                dst_pt = cv2.perspectiveTransform(src_pt, H)
-                px, py = _clamp_point(dst_pt[0][0][0], dst_pt[0][0][1], TACTICAL_WIDTH, TACTICAL_HEIGHT)
-                track_id = player_ids[idx] if player_ids and idx < len(player_ids) else idx
+                if history and len(history) > 0:
+                    px, py = _clamp_point(history[-1][0], history[-1][1], TACTICAL_WIDTH, TACTICAL_HEIGHT)
+                else:
+                    src_pt = np.array([[foot_pt]], dtype=np.float32)
+                    dst_pt = cv2.perspectiveTransform(src_pt, H)
+                    px, py = _clamp_point(dst_pt[0][0][0], dst_pt[0][0][1], TACTICAL_WIDTH, TACTICAL_HEIGHT)
                 color = _track_color_bgr(int(track_id))
                 cv2.circle(tactical, (px, py), point_radius + 1, (255, 255, 255), -1, cv2.LINE_AA)
                 cv2.circle(tactical, (px, py), point_radius, color, -1, cv2.LINE_AA)

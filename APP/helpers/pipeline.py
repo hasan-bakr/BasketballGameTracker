@@ -160,6 +160,20 @@ class BasketballTrackingPipeline:
             debug_suppression=self.config.debug.suppression,
             switch_proxy_max_dist=self.config.tracker.switch_proxy_max_dist,
             switch_proxy_max_dt=self.config.tracker.switch_proxy_max_dt,
+            switch_proxy_min_source_life=self.config.tracker.switch_proxy_min_source_life,
+            duplicate_new_track_max_age=self.config.tracker.duplicate_new_track_max_age,
+            duplicate_existing_min_age=self.config.tracker.duplicate_existing_min_age,
+            duplicate_new_track_iou=self.config.tracker.duplicate_new_track_iou,
+            duplicate_new_track_center_px=self.config.tracker.duplicate_new_track_center_px,
+            mask_reinit_missing_frames=self.config.tracker.mask_reinit_missing_frames,
+            mask_reinit_area_fail_frames=self.config.tracker.mask_reinit_area_fail_frames,
+            mask_reinit_inside_fail_frames=self.config.tracker.mask_reinit_inside_fail_frames,
+            mask_reinit_inside_ratio=self.config.tracker.mask_reinit_inside_ratio,
+            mask_reinit_cooldown=self.config.tracker.mask_reinit_cooldown,
+            mask_assignment_near_iou=self.config.tracker.mask_assignment_near_iou,
+            mask_assignment_min_center_px=self.config.tracker.mask_assignment_min_center_px,
+            mask_assignment_center_scale=self.config.tracker.mask_assignment_center_scale,
+            mask_reuse_min_fill=self.config.tracker.mask_reuse_min_fill,
         )
         self._prev_tracks: List[Dict] = []
         self._supp_det_pairs: Dict = {}
@@ -170,6 +184,7 @@ class BasketballTrackingPipeline:
             "  Tracking: MCByte "
             f"device={self.tracker.device} "
             f"det_conf={self.config.detector.confidence:.2f} "
+            f"det_model_iou={self.config.detector.iou_threshold:.2f} "
             f"track_thresh={self.config.tracker.track_thresh:.2f} "
             f"new_track_thresh={self.config.tracker.new_track_thresh:.2f} "
             f"track_buffer={self.config.tracker.track_buffer} "
@@ -181,6 +196,11 @@ class BasketballTrackingPipeline:
             f"mask_guard=(expand={self.config.tracker.mask_bbox_expand:.2f},"
             f"inside>={self.config.tracker.mask_min_bbox_inside_ratio:.2f},"
             f"area>={self.config.tracker.mask_min_area_px}) "
+            f"mask_iso=(iou>={self.config.tracker.mask_assignment_near_iou:.2f},"
+            f"d<={self.config.tracker.mask_assignment_min_center_px:.0f}px) "
+            f"young_dup=(age<={self.config.tracker.duplicate_new_track_max_age},"
+            f"old>={self.config.tracker.duplicate_existing_min_age},"
+            f"iou>={self.config.tracker.duplicate_new_track_iou:.2f}) "
             f"ref_conflict=(iou>={self.config.tracker.ref_player_conflict_iou:.2f},"
             f"fill>={self.config.tracker.ref_player_conflict_mask_fill:.2f},"
             f"margin={self.config.tracker.ref_player_conflict_conf_margin:.2f}) "
@@ -217,6 +237,7 @@ class BasketballTrackingPipeline:
         # Keypoint / homography state
         self.last_good_keypoints         = None
         self.last_H                      = None
+        self._court_side: Optional[str]  = None
         self.homography_success_count    = 0
         self._last_keypoints             = (np.zeros((18, 2), dtype=np.float32), np.zeros(18), None)
         self._prev_detected_keypoints    = np.zeros((18, 2), dtype=np.float32)
@@ -242,7 +263,7 @@ class BasketballTrackingPipeline:
         self.trace_annotator = sv.TraceAnnotator(
             color=self._player_palette,
             color_lookup=sv.ColorLookup.TRACK,
-            trace_length=self.config.visualization.trail_length,
+            trace_length=max(1, self.config.visualization.trail_length),
             thickness=2,
             position=sv.Position.BOTTOM_CENTER,
         )
@@ -340,6 +361,28 @@ class BasketballTrackingPipeline:
             if not _valid(keypoints_xy[i]):
                 keypoints_xy[i] = 0.0
 
+        observed_side, side_counts = self._detected_court_side(keypoints_xy, confidences)
+        side_switched = False
+        if observed_side is not None and self._court_side is not None and observed_side != self._court_side:
+            side_switched = True
+            old_side = self._court_side
+            self._court_side = None
+            self.last_good_keypoints = None
+            self.last_H = None
+            self._prev_detected_keypoints[:] = 0.0
+            self._keypoint_stationary_counts[:] = 0
+            self._keypoint_missing_counts[:] = self.config.keypoints.carry_missing_updates + 1
+            self._tactical_history.clear()
+            self._tactical_smoothed.clear()
+            if self.config.debug.keypoints:
+                frame_label = "-" if frame_idx is None else str(frame_idx)
+                src_label = "-" if src_idx is None else str(src_idx)
+                print(
+                    f"    [kp-side-switch] frame={frame_label} src={src_label} "
+                    f"{old_side}->{observed_side} "
+                    f"left={side_counts[0]} center={side_counts[1]} right={side_counts[2]}"
+                )
+
         if self.last_good_keypoints is not None:
             valid_pairs = [
                 i for i in range(18)
@@ -373,7 +416,7 @@ class BasketballTrackingPipeline:
                 confidences[i]  = 0.0
 
         high_conf = np.where(
-            (confidences >= 0.5).reshape(-1, 1) & (keypoints_xy > 0),
+            (confidences >= self.config.keypoints.geometry_confidence).reshape(-1, 1) & (keypoints_xy > 0),
             keypoints_xy, 0.0,
         ).astype(np.float32)
         pre_H = compute_homography(high_conf) if (high_conf > 0).any() else None
@@ -415,16 +458,25 @@ class BasketballTrackingPipeline:
                 keypoints_xy[i] = 0.0
                 confidences[i] = 0.0
 
-        self.last_good_keypoints = keypoints_xy.copy()
-        H = compute_homography(keypoints_xy)
-        if H is not None:
+        candidate_keypoints = keypoints_xy.copy()
+        final_valid_count = int(((keypoints_xy > 0).all(axis=1)).sum())
+        candidate_H = compute_homography(candidate_keypoints)
+        H = candidate_H
+        h_status = "fail"
+        if H is not None and self._accept_homography_update(H, frame.shape, final_valid_count):
             self.homography_success_count += 1
+            self.last_good_keypoints = candidate_keypoints.copy()
             self.last_H = H
+            if observed_side is not None:
+                self._court_side = observed_side
+            h_status = "ok"
         else:
             H = self.last_H
+            h_status = "fallback" if H is not None else "fail"
+            if H is not None and self.last_good_keypoints is not None:
+                keypoints_xy = self.last_good_keypoints.copy()
 
         if self.config.debug.keypoints:
-            final_valid_count = int(((keypoints_xy > 0).all(axis=1)).sum())
             frame_label = "-" if frame_idx is None else str(frame_idx)
             src_label = "-" if src_idx is None else str(src_idx)
             print(
@@ -435,10 +487,81 @@ class BasketballTrackingPipeline:
                 f"conf>=0.1={raw_conf_01} conf>=0.5={raw_conf_05} "
                 f"final_valid={final_valid_count}/18 "
                 f"carried={carried_count} "
-                f"H={'ok' if H is not None else 'fail'}"
+                f"side={observed_side or self._court_side or '-'} "
+                f"side_counts=(L{side_counts[0]},C{side_counts[1]},R{side_counts[2]}) "
+                f"side_switched={int(side_switched)} "
+                f"H={h_status}"
             )
 
         return keypoints_xy, confidences, H
+
+    def _detected_court_side(
+        self,
+        keypoints_xy: np.ndarray,
+        confidences: np.ndarray,
+    ) -> Tuple[Optional[str], Tuple[int, int, int]]:
+        valid = (keypoints_xy > 0).all(axis=1)
+        confident = confidences >= self.config.keypoints.confidence
+        left_indices = set(self.config.keypoints.left_indices) | {8, 9}
+        center_indices = set(self.config.keypoints.center_indices)
+        right_indices = set(self.config.keypoints.right_indices) | {16, 17}
+
+        left_count = sum(1 for idx in left_indices if idx < len(valid) and valid[idx] and confident[idx])
+        center_count = sum(1 for idx in center_indices if idx < len(valid) and valid[idx] and confident[idx])
+        right_count = sum(1 for idx in right_indices if idx < len(valid) and valid[idx] and confident[idx])
+        min_count = self.config.keypoints.side_switch_min_keypoints
+        center_min = self.config.keypoints.center_switch_min_keypoints
+        margin = self.config.keypoints.side_switch_margin
+
+        if right_count >= min_count and right_count >= left_count + margin:
+            return "right", (left_count, center_count, right_count)
+        if left_count >= min_count and left_count >= right_count + margin:
+            return "left", (left_count, center_count, right_count)
+        if center_count >= center_min:
+            return "center", (left_count, center_count, right_count)
+        return None, (left_count, center_count, right_count)
+
+    def _accept_homography_update(
+        self,
+        H: np.ndarray,
+        frame_shape: Tuple[int, int, int],
+        valid_keypoints: int,
+    ) -> bool:
+        if self.last_H is None:
+            return True
+        if valid_keypoints < self.config.keypoints.homography_min_update_keypoints:
+            return False
+
+        h, w = frame_shape[:2]
+        sample = np.array(
+            [
+                [0.0, 0.0],
+                [w * 0.5, 0.0],
+                [w - 1.0, 0.0],
+                [0.0, h * 0.5],
+                [w * 0.5, h * 0.5],
+                [w - 1.0, h * 0.5],
+                [0.0, h - 1.0],
+                [w * 0.5, h - 1.0],
+                [w - 1.0, h - 1.0],
+            ],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+        try:
+            prev = cv2.perspectiveTransform(sample, self.last_H).reshape(-1, 2)
+            cur = cv2.perspectiveTransform(sample, H).reshape(-1, 2)
+        except cv2.error:
+            return False
+
+        if not np.isfinite(prev).all() or not np.isfinite(cur).all():
+            return False
+        shifts = np.linalg.norm(cur - prev, axis=1)
+        mean_shift = float(np.mean(shifts))
+        max_shift = float(np.max(shifts))
+        return (
+            mean_shift <= self.config.keypoints.homography_max_mean_shift
+            and max_shift <= self.config.keypoints.homography_max_point_shift
+        )
 
     # ── Court boundary filter ──────────────────────────────────────────────────
 
@@ -528,6 +651,37 @@ class BasketballTrackingPipeline:
         inside_area = int(round(total * ratio))
         return ratio, inside_area
 
+    def _bbox_court_overlap(self, bbox: List[int], H: Optional[np.ndarray]) -> Tuple[float, int]:
+        if H is None:
+            return 0.0, 0
+
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        pts = np.array(
+            [
+                [x1 + 0.50 * w, y2],
+                [x1 + 0.25 * w, y2],
+                [x1 + 0.75 * w, y2],
+                [x1 + 0.50 * w, y1 + 0.80 * h],
+                [x1 + 0.50 * w, y1 + 0.65 * h],
+            ],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+        try:
+            projected = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
+        except cv2.error:
+            return 0.0, 0
+
+        inside = (
+            (projected[:, 0] >= 0)
+            & (projected[:, 0] < TACTICAL_WIDTH)
+            & (projected[:, 1] >= 0)
+            & (projected[:, 1] < TACTICAL_HEIGHT)
+        )
+        inside_count = int(np.count_nonzero(inside))
+        return float(inside_count) / float(len(pts)), inside_count
+
     def _activate_tracks_by_court_mask(
         self,
         tracks: List[Dict],
@@ -560,19 +714,32 @@ class BasketballTrackingPipeline:
 
             mask = mask_by_id.get(track_id)
             overlap, inside_area = self._mask_court_overlap(mask, H) if mask is not None else (0.0, 0)
-            should_activate = (
+            mask_activates = (
                 overlap >= self.config.detector.court_mask_min_overlap
                 and inside_area >= self.config.detector.court_mask_min_area_px
             )
+            bbox_overlap, bbox_inside = self._bbox_court_overlap(track["bbox"], H)
+            bbox_activates = bbox_overlap >= 0.40 and bbox_inside >= 2
+            should_activate = mask_activates or bbox_activates
 
             if should_activate:
                 self._court_active_track_ids.add(track_id)
                 kept_players.append(track)
-                if self.config.debug.tracking:
+                if self.config.debug.tracking or self.config.debug.suppression:
+                    source = "mask" if mask_activates else "bbox"
                     print(
                         f"    [court-mask-activate] frame={frame_idx} track={track_id} "
-                        f"overlap={overlap:.3f} inside_area={inside_area} bbox={track['bbox']}"
+                        f"source={source} mask_overlap={overlap:.3f} "
+                        f"mask_area={inside_area} bbox_overlap={bbox_overlap:.2f} "
+                        f"bbox_inside={bbox_inside} bbox={track['bbox']}"
                     )
+            elif self.config.debug.suppression and (mask is None or bbox_overlap > 0.0 or overlap > 0.0):
+                print(
+                    f"    [court-mask-pending] frame={frame_idx} track={track_id} "
+                    f"has_mask={int(mask is not None)} mask_overlap={overlap:.3f} "
+                    f"mask_area={inside_area} bbox_overlap={bbox_overlap:.2f} "
+                    f"bbox_inside={bbox_inside} bbox={track['bbox']}"
+                )
 
         return kept_players + ref_tracks
 
@@ -655,6 +822,20 @@ class BasketballTrackingPipeline:
         tid, _ = self._nearest_track_match(bbox, is_referee)
         return tid
 
+    def _associated_track_age(
+        self,
+        bbox: List[float],
+        is_referee: Optional[bool],
+        frame_idx: int,
+    ) -> int:
+        matches = self._track_candidate_matches(bbox, is_referee)
+        if not matches:
+            return 0
+        birth_frame = self._track_birth_frame.get(int(matches[0]["track_id"]))
+        if birth_frame is None:
+            return 0
+        return max(0, int(frame_idx) - int(birth_frame))
+
     def _update_track_births(self, tracks: List[Dict], frame_idx: int) -> None:
         for track in tracks:
             tid = int(track["track_id"])
@@ -681,6 +862,35 @@ class BasketballTrackingPipeline:
             dt > self.config.detector.duplicate_birth_max_dt
             or dist > self.config.detector.duplicate_birth_max_dist
         )
+
+    def _track_age(self, track: Dict, frame_idx: int) -> int:
+        birth_frame = self._track_birth_frame.get(int(track["track_id"]))
+        if birth_frame is None:
+            return 0
+        return max(0, int(frame_idx) - int(birth_frame))
+
+    def _young_established_pair(
+        self,
+        a: Dict,
+        b: Dict,
+        frame_idx: int,
+    ) -> Tuple[Optional[Dict], Optional[Dict], int, int]:
+        a_age = self._track_age(a, frame_idx)
+        b_age = self._track_age(b, frame_idx)
+        young_max = self.config.tracker.duplicate_new_track_max_age
+        established_min = self.config.tracker.duplicate_existing_min_age
+
+        if a_age <= young_max and b_age >= established_min:
+            return a, b, a_age, b_age
+        if b_age <= young_max and a_age >= established_min:
+            return b, a, b_age, a_age
+        return None, None, a_age, b_age
+
+    def _candidate_age(self, candidate: Dict, frame_idx: int) -> int:
+        birth_frame = self._track_birth_frame.get(int(candidate["track_id"]))
+        if birth_frame is None:
+            return 0
+        return max(0, int(frame_idx) - int(birth_frame))
 
     @staticmethod
     def _format_track_candidates(candidates: List[Dict]) -> str:
@@ -730,6 +940,26 @@ class BasketballTrackingPipeline:
         if pair is None:
             return False
         dropped_match, kept_match = pair
+        dropped_age = self._candidate_age(dropped_match, frame_idx)
+        kept_age = self._candidate_age(kept_match, frame_idx)
+        young_max = self.config.tracker.duplicate_new_track_max_age
+        established_min = self.config.tracker.duplicate_existing_min_age
+        young_overlap = (
+            dropped_age <= young_max
+            and kept_age >= established_min
+        ) or (
+            kept_age <= young_max
+            and dropped_age >= established_min
+        )
+        if young_overlap and det_iou >= self.config.detector.detection_nms_iou:
+            if self.config.debug.suppression:
+                print(
+                    f"    [nms:hold det f={frame_idx}] "
+                    f"tid={int(dropped_match['track_id'])}({dropped_age}f) "
+                    f"vs tid={int(kept_match['track_id'])}({kept_age}f) "
+                    f"det_iou={det_iou:.2f} reason=young_overlap"
+                )
+            return False
         if self.config.debug.suppression:
             print(
                 f"    [nms:bypass det f={frame_idx}] "
@@ -746,6 +976,20 @@ class BasketballTrackingPipeline:
             return False
         if bool(track.get("is_referee", False)) != bool(kept_track.get("is_referee", False)):
             return False
+        young, established, young_age, established_age = self._young_established_pair(
+            track,
+            kept_track,
+            frame_idx,
+        )
+        if young is not None and track_iou >= self.config.tracker.duplicate_new_track_iou:
+            if self.config.debug.suppression:
+                print(
+                    f"    [nms:hold track f={frame_idx}] "
+                    f"young={int(young['track_id'])}({young_age}f) "
+                    f"established={int(established['track_id'])}({established_age}f) "
+                    f"iou={track_iou:.2f} reason=young_overlap"
+                )
+            return False
         if not self._different_track_births(track, kept_track):
             return False
         if self.config.debug.suppression:
@@ -761,7 +1005,20 @@ class BasketballTrackingPipeline:
         target_classes = set(self.config.classes.player_classes + [self.config.classes.referee_class])
         target = [d for d in dets if d["class_id"] in target_classes]
         other = [d for d in dets if d["class_id"] not in target_classes]
-        target.sort(key=lambda d: float(d["confidence"]), reverse=True)
+        target.sort(
+            key=lambda d: (
+                min(
+                    self._associated_track_age(
+                        d["bbox"],
+                        d["class_id"] == self.config.classes.referee_class,
+                        frame_idx,
+                    ),
+                    60,
+                ),
+                float(d["confidence"]),
+            ),
+            reverse=True,
+        )
 
         kept: List[Dict] = []
         for det in target:
@@ -817,7 +1074,14 @@ class BasketballTrackingPipeline:
         """Remove overlapping duplicate tracks and role-conflict overlays."""
         if not tracks:
             return tracks
-        ordered = sorted(tracks, key=lambda t: float(t.get("confidence", 0.0)), reverse=True)
+        ordered = sorted(
+            tracks,
+            key=lambda t: (
+                min(self._track_age(t, frame_idx), 60),
+                float(t.get("confidence", 0.0)),
+            ),
+            reverse=True,
+        )
         kept: List[Dict] = []
         for tr in ordered:
             keep = True
@@ -1149,6 +1413,14 @@ class BasketballTrackingPipeline:
             if previous is None:
                 smoothed = (px, py)
             else:
+                max_step = self.config.visualization.tactical_max_step_px
+                dx = px - previous[0]
+                dy = py - previous[1]
+                step = float((dx * dx + dy * dy) ** 0.5)
+                if max_step > 0 and step > max_step:
+                    scale = max_step / step
+                    px = previous[0] + dx * scale
+                    py = previous[1] + dy * scale
                 alpha = self.config.visualization.tactical_smoothing
                 smoothed = (
                     previous[0] * alpha + px * (1.0 - alpha),
@@ -1205,7 +1477,8 @@ class BasketballTrackingPipeline:
                 else str(t["track_id"])
                 for t in player_tracks
             ]
-            result = self.trace_annotator.annotate(scene=result, detections=p_dets)
+            if self.config.visualization.trail_length > 0:
+                result = self.trace_annotator.annotate(scene=result, detections=p_dets)
             result = self.ellipse_annotator.annotate(scene=result, detections=p_dets)
             result = self.label_annotator.annotate(scene=result, detections=p_dets, labels=p_labels)
 
@@ -1296,30 +1569,35 @@ class BasketballTrackingPipeline:
                     kp_xy, kp_conf, H = self._last_keypoints
 
                 if self.config.detector.activate_tracks_by_court_mask:
-                    filtered_dets = list(dets)
+                    court_dets = list(dets)
                 else:
-                    filtered_dets = [
+                    court_dets = [
                         d for d in dets
                         if self._keep_detection_for_court_filter(d, kp_xy, frame.shape[:2])
                     ]
-                filtered_dets = self._dedupe_target_detections(filtered_dets, frame_idx)
+                filtered_dets = self._dedupe_target_detections(court_dets, frame_idx)
 
-                if self.config.debug.tracking:
-                    raw_players = sum(1 for d in dets if d["class_id"] in self.config.classes.player_classes)
-                    raw_refs = sum(1 for d in dets if d["class_id"] == self.config.classes.referee_class)
-                    filt_players = sum(1 for d in filtered_dets if d["class_id"] in self.config.classes.player_classes)
-                    filt_refs = sum(1 for d in filtered_dets if d["class_id"] == self.config.classes.referee_class)
-                    dropped_players = raw_players - filt_players
-                    if dropped_players > 0:
-                        print(
-                            f"    [det-debug] frame={frame_idx} src={src_idx} "
-                            f"players={raw_players}->{filt_players}(dropped={dropped_players}) "
-                            f"refs={raw_refs}->{filt_refs}"
-                        )
+                raw_players = sum(1 for d in dets if d["class_id"] in self.config.classes.player_classes)
+                raw_refs = sum(1 for d in dets if d["class_id"] == self.config.classes.referee_class)
+                court_players = sum(1 for d in court_dets if d["class_id"] in self.config.classes.player_classes)
+                court_refs = sum(1 for d in court_dets if d["class_id"] == self.config.classes.referee_class)
+                filt_players = sum(1 for d in filtered_dets if d["class_id"] in self.config.classes.player_classes)
+                filt_refs = sum(1 for d in filtered_dets if d["class_id"] == self.config.classes.referee_class)
+                dropped_players = raw_players - filt_players
+                if self.config.debug.tracking and dropped_players > 0:
+                    print(
+                        f"    [det-debug] frame={frame_idx} src={src_idx} "
+                        f"players={raw_players}->{filt_players}(dropped={dropped_players}) "
+                        f"refs={raw_refs}->{filt_refs}"
+                    )
 
                 tracks = self.tracker.update(filtered_dets, frame)
                 self._update_track_births(tracks, frame_idx)
+                tracker_player_count = sum(1 for t in tracks if not t.get("is_referee", False))
+                tracker_ref_count = sum(1 for t in tracks if t.get("is_referee", False))
                 tracks = self._dedupe_tracks(tracks, frame_idx)
+                dedupe_player_count = sum(1 for t in tracks if not t.get("is_referee", False))
+                dedupe_ref_count = sum(1 for t in tracks if t.get("is_referee", False))
                 tracks = self._activate_tracks_by_court_mask(
                     tracks,
                     H,
@@ -1330,6 +1608,23 @@ class BasketballTrackingPipeline:
                 self._consume_lifecycle_alias_events(frame_idx)
                 tracks = self._apply_canonical_track_ids(tracks)
                 self._last_player_tracks = [t for t in tracks if not t["is_referee"]]
+                if self.config.debug.suppression:
+                    active_players = len(self._last_player_tracks)
+                    active_refs = sum(1 for t in tracks if t.get("is_referee", False))
+                    if (
+                        raw_players < 10
+                        or filt_players < 10
+                        or active_players < 10
+                        or frame_idx % self.config.debug.progress_interval == 0
+                    ):
+                        print(
+                            f"    [det-flow] frame={frame_idx} src={src_idx} "
+                            f"players raw={raw_players} court={court_players} nms={filt_players} "
+                            f"tracker={tracker_player_count} dedupe={dedupe_player_count} "
+                            f"active={active_players} refs raw={raw_refs} court={court_refs} "
+                            f"nms={filt_refs} tracker={tracker_ref_count} "
+                            f"dedupe={dedupe_ref_count} active={active_refs}"
+                        )
                 if self.config.debug.tracking:
                     self._log_id_debug(tracks, frame_idx)
 

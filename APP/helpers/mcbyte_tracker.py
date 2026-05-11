@@ -18,8 +18,11 @@ MCBYTE_DIR = ROOT_DIR / "external" / "mcbyte"
 if str(MCBYTE_DIR) not in sys.path:
     sys.path.insert(0, str(MCBYTE_DIR))
 
+import mask_propagation.mask_manager as mask_manager_module
 from mask_propagation.mask_manager import MaskManager
 from yolox.tracker.mcbyte_tracker import McByteTracker as _McByteTracker
+
+mask_manager_module.MASK_CREATION_BBOX_OVERLAP_THRESHOLD = 0.85
 
 
 PLAYER_CLASSES = [3, 4, 5, 6, 7]
@@ -58,6 +61,20 @@ class McByteTrackerConfig:
     debug_suppression: bool = False
     switch_proxy_max_dist: float = 150.0
     switch_proxy_max_dt: int = 60
+    switch_proxy_min_source_life: int = 10
+    duplicate_new_track_max_age: int = 5
+    duplicate_existing_min_age: int = 8
+    duplicate_new_track_iou: float = 0.85
+    duplicate_new_track_center_px: float = 45.0
+    mask_reinit_missing_frames: int = 6
+    mask_reinit_area_fail_frames: int = 4
+    mask_reinit_inside_fail_frames: int = 10
+    mask_reinit_inside_ratio: float = 0.12
+    mask_reinit_cooldown: int = 20
+    mask_assignment_near_iou: float = 0.08
+    mask_assignment_min_center_px: float = 55.0
+    mask_assignment_center_scale: float = 0.30
+    mask_reuse_min_fill: float = 0.35
 
 
 class _McByteStream:
@@ -113,6 +130,10 @@ class _McByteStream:
         self.tracklet_mask_dict = {}
         self.mask_avg_prob_dict = {}
         self.mask_duplicate_min_fill = config.mask_duplicate_min_fill
+        self._mask_cut_fail_counts: Dict[int, int] = {}
+        self._mask_missing_counts: Dict[int, int] = {}
+        self._mask_reinit_cooldown: Dict[int, int] = {}
+        self._mask_deferred_requests: Dict[int, int] = {}
 
         # lifecycle tracking
         self._prev_active_ids: set = set()
@@ -139,6 +160,12 @@ class _McByteStream:
         }
 
         if self.mask_manager is not None and self.prev_img_info is not None:
+            mask_new_tracks, mask_removed_track_ids = self._prepare_mask_update_inputs(
+                self.new_tracks,
+                self.removed_track_ids,
+                self.online_tlwhs,
+                self.online_ids,
+            )
             (
                 self.prediction_mask,
                 self.tracklet_mask_dict,
@@ -150,8 +177,8 @@ class _McByteStream:
                 self.frame_id,
                 self.online_tlwhs,
                 self.online_ids,
-                self.new_tracks,
-                self.removed_track_ids,
+                mask_new_tracks,
+                mask_removed_track_ids,
             )
 
         output_results = _detections_to_mcbyte_array(stream_dets)
@@ -178,7 +205,9 @@ class _McByteStream:
             dets_from_file=True,
         )
 
+        online_targets = self._suppress_unstable_overlap_targets(online_targets)
         online_targets = self._suppress_duplicate_mask_targets(online_targets)
+        self._schedule_missing_track_masks(online_targets)
 
         if self.config.debug_association:
             role = "ref" if self.is_referee else "player"
@@ -223,6 +252,269 @@ class _McByteStream:
         self._update_lifecycle(tracks)
         return tracks
 
+    def _prepare_mask_update_inputs(
+        self,
+        new_tracks: List,
+        removed_track_ids: List[int],
+        online_tlwhs: List,
+        online_ids: List[int],
+    ) -> Tuple[List, List[int]]:
+        if self.mask_manager is None:
+            return list(new_tracks), list(removed_track_ids)
+        if getattr(self.mask_manager, "tracklet_mask_dict", None) is None:
+            return list(new_tracks), list(removed_track_ids)
+
+        online_ids = [int(raw_id) for raw_id in online_ids]
+        tlwh_by_raw = {
+            int(raw_id): tlwh
+            for raw_id, tlwh in zip(online_ids, online_tlwhs)
+        }
+        active_raw_ids = set(online_ids)
+
+        safe_new_tracks = []
+        for track in new_tracks:
+            raw_id = int(track.track_id)
+            tlwh = getattr(track, "last_det_tlwh", None)
+            if tlwh is None:
+                safe_new_tracks.append(track)
+                continue
+            if self._try_reuse_previous_mask(raw_id, tlwh, active_raw_ids):
+                continue
+            blocker = self._mask_creation_blocker(raw_id, tlwh, online_ids, online_tlwhs)
+            if blocker is not None:
+                self._defer_mask_request(raw_id, blocker, "new_track_near_player")
+                continue
+            self._forget_deferred_mask_request(raw_id)
+            safe_new_tracks.append(track)
+
+        awaiting = getattr(self.mask_manager, "awaiting_mask_tracklet_ids", [])
+        requested_ids = []
+        seen = set()
+        for raw_id in list(awaiting) + list(self._mask_deferred_requests):
+            raw_id = int(raw_id)
+            if raw_id in seen:
+                continue
+            seen.add(raw_id)
+            requested_ids.append(raw_id)
+
+        safe_awaiting = []
+        for raw_id in requested_ids:
+            if raw_id not in active_raw_ids:
+                self._forget_deferred_mask_request(raw_id)
+                continue
+            if raw_id in self.tracklet_mask_dict:
+                self._forget_deferred_mask_request(raw_id)
+                continue
+            tlwh = tlwh_by_raw.get(raw_id)
+            if tlwh is None:
+                continue
+            if self._try_reuse_previous_mask(raw_id, tlwh, active_raw_ids):
+                continue
+            blocker = self._mask_creation_blocker(raw_id, tlwh, online_ids, online_tlwhs)
+            if blocker is not None:
+                self._defer_mask_request(raw_id, blocker, "awaiting_near_player")
+                continue
+            self._forget_deferred_mask_request(raw_id)
+            safe_awaiting.append(raw_id)
+
+        self.mask_manager.awaiting_mask_tracklet_ids = safe_awaiting
+        return safe_new_tracks, list(removed_track_ids)
+
+    def _defer_mask_request(self, raw_id: int, blocker: Dict[str, float], reason: str) -> None:
+        first_frame = self._mask_deferred_requests.setdefault(raw_id, self.frame_id)
+        waited = self.frame_id - first_frame
+        if (self.config.debug_masks or self.config.debug_suppression) and (waited == 0 or waited % 10 == 0):
+            print(
+                f"    [mask-await-isolation f={self.frame_id}] "
+                f"tid={raw_id + self.track_id_offset} reason={reason} "
+                f"near={int(blocker['raw_id']) + self.track_id_offset} "
+                f"iou={blocker['iou']:.2f} dist={blocker['dist']:.0f} "
+                f"waited={waited}f"
+            )
+
+    def _forget_deferred_mask_request(self, raw_id: int) -> None:
+        self._mask_deferred_requests.pop(int(raw_id), None)
+
+    def _raw_track_age(self, raw_id: int) -> int:
+        birth_frame = self._track_birth_frame.get(int(raw_id) + self.track_id_offset)
+        if birth_frame is None:
+            return 0
+        return max(0, self.frame_id - birth_frame)
+
+    def _mask_creation_blocker(
+        self,
+        raw_id: int,
+        tlwh,
+        online_ids: List[int],
+        online_tlwhs: List,
+    ) -> Optional[Dict[str, float]]:
+        cfg = self.config
+        tx, ty, tw, th = [float(v) for v in tlwh]
+        best = None
+        best_score = -1.0
+
+        for other_raw, other_tlwh in zip(online_ids, online_tlwhs):
+            other_raw = int(other_raw)
+            if other_raw == int(raw_id):
+                continue
+
+            other_has_mask = other_raw in self.tracklet_mask_dict
+            other_established = self._raw_track_age(other_raw) >= cfg.duplicate_existing_min_age
+            if not other_has_mask and not other_established:
+                continue
+
+            ox, oy, ow, oh = [float(v) for v in other_tlwh]
+            iou = self._tlwh_iou((tx, ty, tw, th), (ox, oy, ow, oh))
+            dist = self._tlwh_center_dist((tx, ty, tw, th), (ox, oy, ow, oh))
+            center_limit = max(
+                cfg.mask_assignment_min_center_px,
+                cfg.mask_assignment_center_scale * max(th, oh),
+            )
+            is_near = iou >= cfg.mask_assignment_near_iou or dist <= center_limit
+            if not is_near:
+                continue
+
+            score = max(iou / max(0.001, cfg.mask_assignment_near_iou), center_limit / max(1.0, dist))
+            if score > best_score:
+                best_score = score
+                best = {
+                    "raw_id": float(other_raw),
+                    "iou": float(iou),
+                    "dist": float(dist),
+                }
+
+        return best
+
+    def _try_reuse_previous_mask(self, raw_id: int, tlwh, active_raw_ids: set) -> bool:
+        if self.prediction_mask is None or not self.tracklet_mask_dict:
+            return False
+
+        mask_id, fill_ratio = self._dominant_mask_for_tlwh(tlwh)
+        if mask_id is None or fill_ratio < self.config.mask_reuse_min_fill:
+            return False
+
+        source_raw = None
+        for mapped_raw, mapped_mask in list(self.tracklet_mask_dict.items()):
+            if int(mapped_mask) == int(mask_id):
+                source_raw = int(mapped_raw)
+                break
+
+        if source_raw == int(raw_id):
+            self._forget_deferred_mask_request(raw_id)
+            return True
+        if source_raw is None or source_raw in active_raw_ids:
+            return False
+
+        self.tracklet_mask_dict.pop(source_raw, None)
+        self.tracklet_mask_dict[int(raw_id)] = int(mask_id)
+        if getattr(self.mask_manager, "tracklet_mask_dict", None) is not None:
+            self.mask_manager.tracklet_mask_dict.pop(source_raw, None)
+            self.mask_manager.tracklet_mask_dict[int(raw_id)] = int(mask_id)
+
+        awaiting = getattr(self.mask_manager, "awaiting_mask_tracklet_ids", None)
+        if awaiting is not None:
+            self.mask_manager.awaiting_mask_tracklet_ids = [
+                int(tid) for tid in awaiting if int(tid) != int(raw_id)
+            ]
+        self._mask_missing_counts.pop(int(raw_id), None)
+        self._mask_cut_fail_counts.pop(int(raw_id), None)
+        self._forget_deferred_mask_request(raw_id)
+        if self.config.debug_masks or self.config.debug_suppression:
+            print(
+                f"    [mask-reuse f={self.frame_id}] "
+                f"source={source_raw + self.track_id_offset} "
+                f"new={int(raw_id) + self.track_id_offset} "
+                f"mask={int(mask_id)} fill={fill_ratio:.2f}"
+            )
+        return True
+
+    def _schedule_missing_track_masks(self, online_targets: List) -> None:
+        if self.mask_manager is None or self.tracklet_mask_dict is None:
+            return
+        if not hasattr(self.mask_manager, "awaiting_mask_tracklet_ids"):
+            return
+
+        active_raw_ids = {int(target.track_id) for target in online_targets}
+        for raw_id in list(self._mask_missing_counts):
+            if raw_id not in active_raw_ids:
+                self._mask_missing_counts.pop(raw_id, None)
+        for raw_id in list(self._mask_reinit_cooldown):
+            self._mask_reinit_cooldown[raw_id] -= 1
+            if self._mask_reinit_cooldown[raw_id] <= 0:
+                self._mask_reinit_cooldown.pop(raw_id, None)
+
+        awaiting = self.mask_manager.awaiting_mask_tracklet_ids
+        online_ids = [int(target.track_id) for target in online_targets]
+        online_tlwhs = [target.last_det_tlwh for target in online_targets]
+        active_raw_ids = set(online_ids)
+        for target in online_targets:
+            raw_id = int(target.track_id)
+            if raw_id in self.tracklet_mask_dict:
+                self._mask_missing_counts.pop(raw_id, None)
+                self._forget_deferred_mask_request(raw_id)
+                continue
+            if raw_id in self._mask_reinit_cooldown:
+                continue
+
+            count = self._mask_missing_counts.get(raw_id, 0) + 1
+            self._mask_missing_counts[raw_id] = count
+            if count < self.config.mask_reinit_missing_frames or raw_id in awaiting:
+                continue
+
+            if self._try_reuse_previous_mask(raw_id, target.last_det_tlwh, active_raw_ids):
+                continue
+            blocker = self._mask_creation_blocker(raw_id, target.last_det_tlwh, online_ids, online_tlwhs)
+            if blocker is not None:
+                self._defer_mask_request(raw_id, blocker, "missing_mask_near_player")
+                continue
+
+            awaiting.append(raw_id)
+            self._mask_reinit_cooldown[raw_id] = self.config.mask_reinit_cooldown
+            if self.config.debug_masks or self.config.debug_suppression:
+                print(
+                    f"    [mask-reinit-request f={self.frame_id}] "
+                    f"tid={raw_id + self.track_id_offset} reason=missing_mask "
+                    f"missing_frames={count}"
+                )
+
+    def _invalidate_track_mask(self, raw_id: int, track_id: int, reason: str) -> None:
+        if self.mask_manager is None or self.tracklet_mask_dict is None:
+            return
+        if raw_id not in self.tracklet_mask_dict:
+            return
+        if raw_id in self._mask_reinit_cooldown:
+            return
+
+        old_mask_id = int(self.tracklet_mask_dict.get(raw_id))
+        try:
+            self.mask_manager.remove_masks([raw_id])
+            if getattr(self.mask_manager, "tracklet_mask_dict", None) is not None:
+                self.tracklet_mask_dict = self.mask_manager.tracklet_mask_dict.copy()
+        except Exception as exc:
+            if self.config.debug_masks or self.config.debug_suppression:
+                print(
+                    f"    [mask-reinit-skip f={self.frame_id}] tid={track_id} "
+                    f"mask={old_mask_id} reason={reason} error={exc}"
+                )
+            return
+
+        if self.prediction_mask is not None:
+            self.prediction_mask[self.prediction_mask == old_mask_id] = 0
+        if self.prediction_colors_preserved is not None:
+            self.prediction_colors_preserved[self.prediction_colors_preserved == old_mask_id] = 0
+
+        awaiting = getattr(self.mask_manager, "awaiting_mask_tracklet_ids", None)
+        if awaiting is not None and raw_id not in awaiting:
+            awaiting.append(raw_id)
+        self._mask_cut_fail_counts.pop(raw_id, None)
+        self._mask_missing_counts[raw_id] = 0
+        self._mask_reinit_cooldown[raw_id] = self.config.mask_reinit_cooldown
+        if self.config.debug_masks or self.config.debug_suppression:
+            print(
+                f"    [mask-reinit-request f={self.frame_id}] tid={track_id} "
+                f"old_mask={old_mask_id} reason={reason}"
+            )
+
     def get_track_candidates(self) -> List[Dict]:
         candidates: List[Dict] = []
         seen = set()
@@ -254,6 +546,86 @@ class _McByteStream:
                     }
                 )
         return candidates
+
+    def _target_age(self, target) -> int:
+        offset_tid = int(target.track_id) + self.track_id_offset
+        birth_frame = self._track_birth_frame.get(offset_tid)
+        if birth_frame is not None:
+            return max(0, self.frame_id - birth_frame)
+        start_frame = int(getattr(target, "start_frame", self.frame_id))
+        return max(0, self.frame_id - start_frame)
+
+    def _suppress_unstable_overlap_targets(self, online_targets: List) -> List:
+        if len(online_targets) <= 1:
+            return list(online_targets)
+
+        cfg = self.config
+        secondary_iou = max(0.70, cfg.duplicate_new_track_iou - 0.15)
+        ordered = sorted(
+            online_targets,
+            key=lambda target: (
+                min(self._target_age(target), 60),
+                float(getattr(target, "score", 0.0)),
+                -int(target.track_id),
+            ),
+            reverse=True,
+        )
+
+        kept = []
+        suppressed_ids = set()
+        for target in ordered:
+            raw_id = int(target.track_id)
+            age = self._target_age(target)
+            drop_for = None
+            drop_iou = 0.0
+            drop_dist = 0.0
+            drop_age = 0
+            target_tlwh = getattr(target, "last_det_tlwh", None)
+            if target_tlwh is None:
+                kept.append(target)
+                continue
+
+            for prev in kept:
+                prev_tlwh = getattr(prev, "last_det_tlwh", None)
+                if prev_tlwh is None:
+                    continue
+                prev_age = self._target_age(prev)
+                young_vs_established = (
+                    age <= cfg.duplicate_new_track_max_age
+                    and prev_age >= cfg.duplicate_existing_min_age
+                )
+                if not young_vs_established:
+                    continue
+
+                iou = self._tlwh_iou(target_tlwh, prev_tlwh)
+                dist = self._tlwh_center_dist(target_tlwh, prev_tlwh)
+                if iou >= cfg.duplicate_new_track_iou or (
+                    iou >= secondary_iou
+                    and dist <= cfg.duplicate_new_track_center_px
+                ):
+                    drop_for = prev
+                    drop_iou = iou
+                    drop_dist = dist
+                    drop_age = prev_age
+                    break
+
+            if drop_for is None:
+                kept.append(target)
+                continue
+
+            suppressed_ids.add(raw_id)
+            if self.config.debug_masks or self.config.debug_suppression:
+                print(
+                    f"    [track-duplicate-new f={self.frame_id}] "
+                    f"drop={raw_id + self.track_id_offset} "
+                    f"keep={int(drop_for.track_id) + self.track_id_offset} "
+                    f"iou={drop_iou:.2f} dist={drop_dist:.0f} "
+                    f"age={age} keep_age={drop_age}"
+                )
+
+        if not suppressed_ids:
+            return list(online_targets)
+        return [target for target in online_targets if int(target.track_id) not in suppressed_ids]
 
     def _suppress_duplicate_mask_targets(self, online_targets: List) -> List:
         if self.prediction_mask is None or len(online_targets) <= 1:
@@ -462,6 +834,8 @@ class _McByteStream:
                 went_lost.append(tid)
 
         removed = []
+        newly_removed_ids = set()
+        removed_life_by_tid: Dict[int, int] = {}
         for tid in rm_ids:
             if tid in self._removed_seen:
                 continue
@@ -470,6 +844,8 @@ class _McByteStream:
             self._lost_since.pop(tid, None)
             self._lost_positions.pop(tid, None)
             removed.append((tid, life))
+            newly_removed_ids.add(tid)
+            removed_life_by_tid[tid] = life
 
         max_dist = self.config.switch_proxy_max_dist
         max_dt = self.config.switch_proxy_max_dt
@@ -536,7 +912,16 @@ class _McByteStream:
             self.events.append(event)
 
         # store removed track positions for future REMOVED→NEW detection
-        for tid in rm_ids:
+        for tid in newly_removed_ids:
+            life = removed_life_by_tid.get(tid, 0)
+            if life < self.config.switch_proxy_min_source_life:
+                if self.config.debug_lifecycle or self.config.debug_suppression:
+                    print(
+                        f"    [switch:ignore-short-rm {role} f={self.frame_id}] "
+                        f"tid={tid} life={life}f "
+                        f"min_life={self.config.switch_proxy_min_source_life}f"
+                    )
+                continue
             raw = tid - self.track_id_offset
             if raw in self.tracklet_mask_dict:
                 continue
@@ -640,17 +1025,42 @@ class _McByteStream:
             raw_id = int(track.get("raw_track_id", track["track_id"] - self.track_id_offset))
             mask_id = self.tracklet_mask_dict.get(raw_id)
             if mask_id is None:
+                if self.config.debug_masks or self.config.debug_suppression:
+                    missing = self._mask_missing_counts.get(raw_id, 0)
+                    if missing >= 2:
+                        print(
+                            f"    [mask-missing f={self.frame_id}] "
+                            f"tid={int(track['track_id'])} missing_frames={missing} "
+                            f"bbox={track['bbox']}"
+                        )
                 continue
             mask = mask_map == int(mask_id)
             mask, stats = self._clip_mask_to_track_bbox(mask, track["bbox"])
             if mask is None:
+                fail_count = self._mask_cut_fail_counts.get(raw_id, 0) + 1
+                self._mask_cut_fail_counts[raw_id] = fail_count
+                area_too_small = stats["area"] < self.config.mask_min_area_px
+                reason = "area_too_small" if area_too_small else "inside_ratio"
                 if self.config.debug_masks or self.config.debug_suppression:
-                    reason = "area_too_small" if stats["area"] < self.config.mask_min_area_px else "inside_ratio"
                     print(
                         f"    [mask-cut f={self.frame_id}] tid={int(track['track_id'])} "
-                        f"reason={reason} inside={stats['inside_ratio']:.2f} area={stats['area']:.0f}"
+                        f"reason={reason} inside={stats['inside_ratio']:.2f} "
+                        f"area={stats['area']:.0f} misses={fail_count}"
                     )
+                should_reinit = (
+                    area_too_small
+                    and fail_count >= self.config.mask_reinit_area_fail_frames
+                ) or (
+                    not area_too_small
+                    and stats["inside_ratio"] <= self.config.mask_reinit_inside_ratio
+                    and fail_count >= self.config.mask_reinit_inside_fail_frames
+                )
+                if should_reinit:
+                    reinit_reason = "cut_area_too_small" if area_too_small else "cut_inside_ratio"
+                    self._invalidate_track_mask(raw_id, int(track["track_id"]), reinit_reason)
                 continue
+            self._mask_cut_fail_counts.pop(raw_id, None)
+            self._mask_missing_counts.pop(raw_id, None)
             mask_tracks.append(track)
             masks.append(mask)
 
@@ -706,6 +1116,20 @@ class McByteBasketballTracker:
         debug_suppression: bool = False,
         switch_proxy_max_dist: float = 80.0,
         switch_proxy_max_dt: int = 30,
+        switch_proxy_min_source_life: int = 10,
+        duplicate_new_track_max_age: int = 5,
+        duplicate_existing_min_age: int = 8,
+        duplicate_new_track_iou: float = 0.85,
+        duplicate_new_track_center_px: float = 45.0,
+        mask_reinit_missing_frames: int = 6,
+        mask_reinit_area_fail_frames: int = 4,
+        mask_reinit_inside_fail_frames: int = 10,
+        mask_reinit_inside_ratio: float = 0.12,
+        mask_reinit_cooldown: int = 20,
+        mask_assignment_near_iou: float = 0.08,
+        mask_assignment_min_center_px: float = 55.0,
+        mask_assignment_center_scale: float = 0.30,
+        mask_reuse_min_fill: float = 0.35,
     ):
         resolved_device = _resolve_device(device, require_cuda=require_cuda)
         config = McByteTrackerConfig(
@@ -739,6 +1163,20 @@ class McByteBasketballTracker:
             debug_suppression=debug_suppression,
             switch_proxy_max_dist=switch_proxy_max_dist,
             switch_proxy_max_dt=switch_proxy_max_dt,
+            switch_proxy_min_source_life=switch_proxy_min_source_life,
+            duplicate_new_track_max_age=duplicate_new_track_max_age,
+            duplicate_existing_min_age=duplicate_existing_min_age,
+            duplicate_new_track_iou=duplicate_new_track_iou,
+            duplicate_new_track_center_px=duplicate_new_track_center_px,
+            mask_reinit_missing_frames=mask_reinit_missing_frames,
+            mask_reinit_area_fail_frames=mask_reinit_area_fail_frames,
+            mask_reinit_inside_fail_frames=mask_reinit_inside_fail_frames,
+            mask_reinit_inside_ratio=mask_reinit_inside_ratio,
+            mask_reinit_cooldown=mask_reinit_cooldown,
+            mask_assignment_near_iou=mask_assignment_near_iou,
+            mask_assignment_min_center_px=mask_assignment_min_center_px,
+            mask_assignment_center_scale=mask_assignment_center_scale,
+            mask_reuse_min_fill=mask_reuse_min_fill,
         )
         self.device = resolved_device
         self.player_stream = _McByteStream(

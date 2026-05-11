@@ -91,6 +91,8 @@ def main():
     parser.add_argument("--device",     default=None,               help="Compute device override (default: from config)")
     parser.add_argument("--log-file",   default=None,               help="Verbose log path (default: output_dir/LOG.log)")
     parser.add_argument("--confidence", type=float, default=None,   help="Detector confidence override (default: from config)")
+    parser.add_argument("--detector-iou", type=float, default=None,
+                        help="RF-DETR internal NMS IoU override (higher keeps more overlapping boxes)")
     parser.add_argument("--track-thresh", type=float, default=None, help="MCByte high-score tracking threshold override")
     parser.add_argument("--new-track-thresh", type=float, default=None,
                         help="MCByte threshold for starting a new track override")
@@ -128,6 +130,8 @@ def main():
                     config.device = args.device
                 if args.confidence is not None:
                     config.detector.confidence = args.confidence
+                if args.detector_iou is not None:
+                    config.detector.iou_threshold = args.detector_iou
                 if args.track_thresh is not None:
                     config.tracker.track_thresh = args.track_thresh
                 if args.new_track_thresh is not None:
