@@ -150,9 +150,22 @@ class BasketballTrackingPipeline:
             use_player_masks=self.config.tracker.use_player_masks,
             use_referee_masks=self.config.tracker.use_referee_masks,
             require_cuda=self.config.tracker.require_cuda,
+            sam_model_type=self.config.tracker.sam_model_type,
+            sam_checkpoint=self.config.tracker.sam_checkpoint,
+            cutie_weights=self.config.tracker.cutie_weights,
+            cutie_max_internal_size=self.config.tracker.cutie_max_internal_size,
             debug_masks=self.config.debug.masks,
             debug_association=self.config.debug.tracking,
+            debug_lifecycle=self.config.debug.lifecycle,
+            debug_suppression=self.config.debug.suppression,
+            switch_proxy_max_dist=self.config.tracker.switch_proxy_max_dist,
+            switch_proxy_max_dt=self.config.tracker.switch_proxy_max_dt,
         )
+        self._prev_tracks: List[Dict] = []
+        self._supp_det_pairs: Dict = {}
+        self._supp_det_duplicate_pairs: Dict = {}
+        self._track_birth_frame: Dict[int, int] = {}
+        self._track_birth_center: Dict[int, Tuple[float, float]] = {}
         print(
             "  Tracking: MCByte "
             f"device={self.tracker.device} "
@@ -173,10 +186,16 @@ class BasketballTrackingPipeline:
             f"margin={self.config.tracker.ref_player_conflict_conf_margin:.2f}) "
             f"player_masks={int(self.config.tracker.use_player_masks)} "
             f"referee_masks={int(self.config.tracker.use_referee_masks)} "
+            f"sam={self.config.tracker.sam_model_type} "
+            f"cutie_size={self.config.tracker.cutie_max_internal_size} "
             f"debug={int(self.config.debug.enabled)} "
             f"id_jump_px={self.config.debug.id_jump_px:.0f} "
             f"id_swap_px={self.config.debug.id_swap_px:.0f} "
             f"det_nms_iou={self.config.detector.detection_nms_iou:.2f} "
+            f"track_aware_supp={int(self.config.detector.track_aware_suppression)} "
+            f"match_iou={self.config.detector.track_match_iou:.2f} "
+            f"lost_match=(iou>={self.config.detector.lost_track_match_iou:.2f},"
+            f"dist<={self.config.detector.lost_track_match_center_px:.0f}) "
             f"court_mask_activation={int(self.config.detector.activate_tracks_by_court_mask)} "
             f"court_mask=(overlap>={self.config.detector.court_mask_min_overlap:.2f},"
             f"area>={self.config.detector.court_mask_min_area_px}) "
@@ -205,6 +224,8 @@ class BasketballTrackingPipeline:
         self._keypoint_missing_counts    = np.full(18, self.config.keypoints.carry_missing_updates + 1, dtype=np.int32)
 
         self.locked_jersey_ids: set = set()
+        self._track_id_alias: Dict[int, int] = {}
+        self._lifecycle_event_cursor: int = 0
         self._prev_id_debug: Dict[int, Dict] = {}
         self._prev_raw_to_stable_debug: Dict[int, int] = {}
         self._last_player_tracks: List[Dict] = []
@@ -552,11 +573,6 @@ class BasketballTrackingPipeline:
                         f"    [court-mask-activate] frame={frame_idx} track={track_id} "
                         f"overlap={overlap:.3f} inside_area={inside_area} bbox={track['bbox']}"
                     )
-            elif self.config.debug.tracking:
-                print(
-                    f"    [court-mask-pending] frame={frame_idx} track={track_id} "
-                    f"overlap={overlap:.3f} inside_area={inside_area} bbox={track['bbox']}"
-                )
 
         return kept_players + ref_tracks
 
@@ -573,7 +589,174 @@ class BasketballTrackingPipeline:
         area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
         return inter / (area_a + area_b - inter)
 
-    def _dedupe_target_detections(self, dets: List[Dict]) -> List[Dict]:
+    @staticmethod
+    def _bbox_center(bbox: List[float]) -> Tuple[float, float]:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    def _current_track_candidates(self) -> List[Dict]:
+        if hasattr(self.tracker, "get_track_candidates"):
+            candidates = self.tracker.get_track_candidates()
+        else:
+            candidates = []
+        if candidates:
+            return candidates
+        return [
+            {
+                "track_id": int(track["track_id"]),
+                "bbox": track["bbox"],
+                "is_referee": bool(track.get("is_referee", False)),
+                "state": "active",
+                "age": 0,
+            }
+            for track in self._prev_tracks
+        ]
+
+    def _track_candidate_matches(self, bbox: List[float], is_referee: Optional[bool] = None) -> List[Dict]:
+        bx, by = self._bbox_center(bbox)
+        matches: List[Dict] = []
+        for candidate in self._current_track_candidates():
+            if is_referee is not None and bool(candidate.get("is_referee", False)) != is_referee:
+                continue
+            iou = self._bbox_iou(bbox, candidate["bbox"])
+            cx, cy = self._bbox_center(candidate["bbox"])
+            dist = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
+            state = str(candidate.get("state", "active"))
+            if state == "lost":
+                matched = (
+                    iou >= self.config.detector.lost_track_match_iou
+                    or dist <= self.config.detector.lost_track_match_center_px
+                )
+            else:
+                matched = iou >= self.config.detector.track_match_iou
+            if not matched:
+                continue
+            score = iou
+            if state == "active":
+                score += 0.25
+            score -= min(dist, 500.0) / 5000.0
+            matches.append({
+                "track_id": int(candidate["track_id"]),
+                "state": state,
+                "iou": iou,
+                "dist": dist,
+                "score": score,
+            })
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        return matches
+
+    def _nearest_track_match(self, bbox: List[float], is_referee: Optional[bool] = None) -> Tuple[Optional[int], float]:
+        matches = self._track_candidate_matches(bbox, is_referee)
+        if not matches:
+            return None, 0.0
+        return int(matches[0]["track_id"]), float(matches[0]["iou"])
+
+    def _nearest_track_id(self, bbox: List[float], is_referee: Optional[bool] = None) -> Optional[int]:
+        tid, _ = self._nearest_track_match(bbox, is_referee)
+        return tid
+
+    def _update_track_births(self, tracks: List[Dict], frame_idx: int) -> None:
+        for track in tracks:
+            tid = int(track["track_id"])
+            if tid in self._track_birth_frame:
+                continue
+            self._track_birth_frame[tid] = frame_idx
+            self._track_birth_center[tid] = self._bbox_center(track["bbox"])
+
+    def _different_track_births(self, a: Dict, b: Dict) -> bool:
+        a_tid = int(a["track_id"])
+        b_tid = int(b["track_id"])
+        if a_tid == b_tid:
+            return False
+        a_frame = self._track_birth_frame.get(a_tid)
+        b_frame = self._track_birth_frame.get(b_tid)
+        a_center = self._track_birth_center.get(a_tid)
+        b_center = self._track_birth_center.get(b_tid)
+        if a_frame is None or b_frame is None or a_center is None or b_center is None:
+            return False
+
+        dt = abs(a_frame - b_frame)
+        dist = ((a_center[0] - b_center[0]) ** 2 + (a_center[1] - b_center[1]) ** 2) ** 0.5
+        return (
+            dt > self.config.detector.duplicate_birth_max_dt
+            or dist > self.config.detector.duplicate_birth_max_dist
+        )
+
+    @staticmethod
+    def _format_track_candidates(candidates: List[Dict]) -> str:
+        if not candidates:
+            return "[]"
+        return "[" + ",".join(
+            f"{int(c['track_id'])}:{c['state']}:iou={float(c['iou']):.2f}:d={float(c['dist']):.0f}"
+            for c in candidates[:5]
+        ) + "]"
+
+    @staticmethod
+    def _distinct_candidate_pair(a_candidates: List[Dict], b_candidates: List[Dict]) -> Optional[Tuple[Dict, Dict]]:
+        best_pair = None
+        best_score = -1e9
+        for a in a_candidates:
+            for b in b_candidates:
+                if int(a["track_id"]) == int(b["track_id"]):
+                    continue
+                score = float(a["score"]) + float(b["score"])
+                if score > best_score:
+                    best_score = score
+                    best_pair = (a, b)
+        return best_pair
+
+    def _det_nms_bypass(
+        self,
+        det: Dict,
+        kept_det: Dict,
+        frame_idx: int,
+        det_iou: float,
+    ) -> bool:
+        if not self.config.detector.track_aware_suppression:
+            return False
+        is_ref = det["class_id"] == self.config.classes.referee_class
+        kept_is_ref = kept_det["class_id"] == self.config.classes.referee_class
+        if is_ref != kept_is_ref:
+            return False
+        dropped_candidates = self._track_candidate_matches(det["bbox"], is_ref)
+        kept_candidates = self._track_candidate_matches(kept_det["bbox"], kept_is_ref)
+        if self.config.debug.suppression:
+            print(
+                f"    [nms:candidates det f={frame_idx}] "
+                f"drop={self._format_track_candidates(dropped_candidates)} "
+                f"kept={self._format_track_candidates(kept_candidates)}"
+            )
+        pair = self._distinct_candidate_pair(dropped_candidates, kept_candidates)
+        if pair is None:
+            return False
+        dropped_match, kept_match = pair
+        if self.config.debug.suppression:
+            print(
+                f"    [nms:bypass det f={frame_idx}] "
+                f"tid={int(dropped_match['track_id'])}({dropped_match['state']}) "
+                f"vs tid={int(kept_match['track_id'])}({kept_match['state']}) "
+                f"det_iou={det_iou:.2f} "
+                f"match=({float(dropped_match['iou']):.2f},{float(kept_match['iou']):.2f}) "
+                f"reason=different_active_or_lost_tracks"
+            )
+        return True
+
+    def _track_nms_bypass(self, track: Dict, kept_track: Dict, frame_idx: int, track_iou: float) -> bool:
+        if not self.config.detector.track_aware_suppression:
+            return False
+        if bool(track.get("is_referee", False)) != bool(kept_track.get("is_referee", False)):
+            return False
+        if not self._different_track_births(track, kept_track):
+            return False
+        if self.config.debug.suppression:
+            print(
+                f"    [nms:bypass track f={frame_idx}] "
+                f"tid={int(track['track_id'])} vs tid={int(kept_track['track_id'])} "
+                f"iou={track_iou:.2f} reason=different_birth"
+            )
+        return True
+
+    def _dedupe_target_detections(self, dets: List[Dict], frame_idx: int = 0) -> List[Dict]:
         """Suppress near-duplicate player/referee detections before tracking."""
         target_classes = set(self.config.classes.player_classes + [self.config.classes.referee_class])
         target = [d for d in dets if d["class_id"] in target_classes]
@@ -584,20 +767,53 @@ class BasketballTrackingPipeline:
         for det in target:
             is_ref = det["class_id"] == self.config.classes.referee_class
             keep = True
+            suppress_by = None
+            suppress_iou = 0.0
             for prev in kept:
                 prev_is_ref = prev["class_id"] == self.config.classes.referee_class
                 iou = self._bbox_iou(det["bbox"], prev["bbox"])
                 if is_ref == prev_is_ref and iou >= self.config.detector.detection_nms_iou:
+                    if self._det_nms_bypass(det, prev, frame_idx, iou):
+                        continue
                     keep = False
+                    suppress_by = prev
+                    suppress_iou = iou
                     break
                 if is_ref != prev_is_ref and iou >= self.config.detector.cross_role_iou:
                     keep = False
+                    suppress_by = prev
+                    suppress_iou = iou
                     break
             if keep:
                 kept.append(det)
+            elif self.config.debug.suppression and suppress_by is not None:
+                dropped_tid = self._nearest_track_id(det["bbox"], is_ref)
+                kept_tid = self._nearest_track_id(
+                    suppress_by["bbox"],
+                    suppress_by["class_id"] == self.config.classes.referee_class,
+                )
+                print(
+                    f"    [supp:det f={frame_idx}] drop near_tid={dropped_tid} "
+                    f"cls={det['class_id']} conf={det['confidence']:.2f} "
+                    f"iou={suppress_iou:.2f} vs kept near_tid={kept_tid} conf={suppress_by['confidence']:.2f}"
+                )
+                pair = (dropped_tid, kept_tid)
+                if dropped_tid is not None and dropped_tid == kept_tid:
+                    self._supp_det_duplicate_pairs.setdefault(pair, []).append(frame_idx)
+                    print(
+                        f"    [nms:drop duplicate f={frame_idx}] "
+                        f"tid={dropped_tid} iou={suppress_iou:.2f} reason=same_prev_track"
+                    )
+                else:
+                    self._supp_det_pairs.setdefault(pair, []).append(frame_idx)
+                    print(
+                        f"    [nms:drop duplicate f={frame_idx}] "
+                        f"drop_tid={dropped_tid} kept_tid={kept_tid} "
+                        f"iou={suppress_iou:.2f} reason=no_distinct_candidate"
+                    )
         return kept + other
 
-    def _dedupe_tracks(self, tracks: List[Dict]) -> List[Dict]:
+    def _dedupe_tracks(self, tracks: List[Dict], frame_idx: int = 0) -> List[Dict]:
         """Remove overlapping duplicate tracks and role-conflict overlays."""
         if not tracks:
             return tracks
@@ -605,17 +821,93 @@ class BasketballTrackingPipeline:
         kept: List[Dict] = []
         for tr in ordered:
             keep = True
+            suppress_by = None
+            suppress_iou = 0.0
             for prev in kept:
                 iou = self._bbox_iou(tr["bbox"], prev["bbox"])
                 if tr["is_referee"] == prev["is_referee"] and iou >= self.config.detector.track_nms_iou:
+                    if self._track_nms_bypass(tr, prev, frame_idx, iou):
+                        continue
                     keep = False
+                    suppress_by = prev
+                    suppress_iou = iou
                     break
                 if tr["is_referee"] != prev["is_referee"] and iou >= self.config.detector.cross_role_iou:
                     keep = False
+                    suppress_by = prev
+                    suppress_iou = iou
                     break
             if keep:
                 kept.append(tr)
+            elif self.config.debug.suppression and suppress_by is not None:
+                print(
+                    f"    [supp:track f={frame_idx}] drop tid={int(tr['track_id'])} "
+                    f"conf={tr.get('confidence', 0.0):.2f} iou={suppress_iou:.2f} "
+                    f"vs kept tid={int(suppress_by['track_id'])} conf={suppress_by.get('confidence', 0.0):.2f}"
+                )
+                if tr["is_referee"] == suppress_by["is_referee"]:
+                    print(
+                        f"    [nms:drop duplicate f={frame_idx}] "
+                        f"tid={int(tr['track_id'])} vs tid={int(suppress_by['track_id'])} "
+                        f"iou={suppress_iou:.2f} reason=same_birth"
+                    )
         return kept
+
+    def _canonical_track_id(self, track_id: int) -> int:
+        tid = int(track_id)
+        # Keep this one-hop: a switch should preserve the ID that was visible
+        # immediately before the raw tracker changed, not collapse old aliases.
+        return int(self._track_id_alias.get(tid, tid))
+
+    def _relink_track_id(self, old_track_id: int, new_track_id: int, frame_idx: int, reason: str) -> None:
+        old_tid = int(old_track_id)
+        new_tid = int(new_track_id)
+        stable = old_tid
+        if new_tid == stable:
+            return
+        self._track_id_alias[new_tid] = stable
+        if self.config.debug.lifecycle or self.config.debug.suppression:
+            print(
+                f"    [id-alias f={frame_idx}] raw={new_tid} -> stable={stable} "
+                f"source={old_tid} reason={reason}"
+            )
+
+    def _consume_lifecycle_alias_events(self, frame_idx: int) -> None:
+        if not hasattr(self.tracker, "get_lifecycle_events"):
+            return
+        events_by_role = self.tracker.get_lifecycle_events()
+        player_events = events_by_role.get("player", [])
+        new_events = player_events[self._lifecycle_event_cursor:]
+        self._lifecycle_event_cursor = len(player_events)
+        for event in new_events:
+            if event.get("type") != "switch":
+                continue
+            new_tid = event.get("new")
+            if new_tid is None:
+                continue
+            source_tid = event.get("lost", event.get("rm"))
+            if source_tid is None:
+                continue
+            event_frame = int(event.get("frame", frame_idx))
+            self._relink_track_id(int(source_tid), int(new_tid), event_frame, "switch")
+
+    def _apply_canonical_track_ids(self, tracks: List[Dict]) -> List[Dict]:
+        canonical_tracks: List[Dict] = []
+        for track in tracks:
+            if track.get("is_referee", False):
+                canonical_tracks.append(track)
+                continue
+            raw_display_id = int(track["track_id"])
+            stable_id = self._canonical_track_id(raw_display_id)
+            if stable_id == raw_display_id:
+                canonical_tracks.append(track)
+                continue
+            updated = dict(track)
+            updated["raw_display_track_id"] = raw_display_id
+            updated["stable_track_id"] = stable_id
+            updated["track_id"] = stable_id
+            canonical_tracks.append(updated)
+        return canonical_tracks
 
     def _draw_zebra_masks(
         self,
@@ -689,9 +981,12 @@ class BasketballTrackingPipeline:
         for tr in sorted(player_tracks, key=lambda t: int(t.get("track_id", -1))):
             sid = int(tr.get("stable_track_id", tr.get("track_id", -1)))
             rid = int(tr.get("raw_track_id", tr.get("track_id", sid)))
+            jersey = self.jersey_bank.get_jersey(sid) or "-"
+            jersey_label = f"#{jersey}" if jersey != "-" else "-"
             cx, cy = self._bbox_center_xy(tr["bbox"])
             current[sid] = {
                 "raw": rid,
+                "jersey": jersey_label,
                 "bbox": tr["bbox"],
                 "center": (cx, cy),
                 "conf": float(tr.get("confidence", 0.0)),
@@ -711,14 +1006,14 @@ class BasketballTrackingPipeline:
                 raw_changed = int(prev["raw"]) != rid
                 if raw_changed or jump >= self.config.debug.id_jump_px:
                     print(
-                        f"    [id-track] frame={frame_idx} stable={sid} raw={rid} "
+                        f"    [id-track] frame={frame_idx} stable={sid} raw={rid} jersey={jersey_label} "
                         f"prev_raw={int(prev['raw'])} cx={cx:.1f} cy={cy:.1f} "
                         f"jump={jump:.1f} raw_changed={int(raw_changed)} "
                         f"bbox={tr['bbox']}"
                     )
             else:
                 print(
-                    f"    [id-new] frame={frame_idx} stable={sid} raw={rid} "
+                    f"    [id-new] frame={frame_idx} stable={sid} raw={rid} jersey={jersey_label} "
                     f"cx={cx:.1f} cy={cy:.1f} bbox={tr['bbox']}"
                 )
 
@@ -727,8 +1022,9 @@ class BasketballTrackingPipeline:
         for sid in sorted(prev_ids - current_ids):
             prev = self._prev_id_debug[sid]
             px, py = prev["center"]
+            jersey = prev.get("jersey", "-")
             print(
-                f"    [id-lost] frame={frame_idx} stable={sid} raw={int(prev['raw'])} "
+                f"    [id-lost] frame={frame_idx} stable={sid} raw={int(prev['raw'])} jersey={jersey} "
                 f"last_cx={px:.1f} last_cy={py:.1f}"
             )
 
@@ -1006,42 +1302,35 @@ class BasketballTrackingPipeline:
                         d for d in dets
                         if self._keep_detection_for_court_filter(d, kp_xy, frame.shape[:2])
                     ]
-                filtered_dets = self._dedupe_target_detections(filtered_dets)
+                filtered_dets = self._dedupe_target_detections(filtered_dets, frame_idx)
 
                 if self.config.debug.tracking:
                     raw_players = sum(1 for d in dets if d["class_id"] in self.config.classes.player_classes)
                     raw_refs = sum(1 for d in dets if d["class_id"] == self.config.classes.referee_class)
-                    raw_numbers = sum(1 for d in dets if d["class_id"] == self.config.classes.jersey_number_class)
                     filt_players = sum(1 for d in filtered_dets if d["class_id"] in self.config.classes.player_classes)
                     filt_refs = sum(1 for d in filtered_dets if d["class_id"] == self.config.classes.referee_class)
                     dropped_players = raw_players - filt_players
-                    print(
-                        f"    [det-debug] frame={frame_idx} src={src_idx} "
-                        f"raw_players={raw_players} raw_refs={raw_refs} raw_numbers={raw_numbers} "
-                        f"filtered_players={filt_players} filtered_refs={filt_refs} "
-                        f"dropped_players={dropped_players} "
-                        f"kp={int((kp_xy > 0).all(axis=1).sum())}/18"
-                    )
+                    if dropped_players > 0:
+                        print(
+                            f"    [det-debug] frame={frame_idx} src={src_idx} "
+                            f"players={raw_players}->{filt_players}(dropped={dropped_players}) "
+                            f"refs={raw_refs}->{filt_refs}"
+                        )
 
                 tracks = self.tracker.update(filtered_dets, frame)
-                tracks = self._dedupe_tracks(tracks)
-                pre_activation_players = sum(1 for t in tracks if not t["is_referee"])
+                self._update_track_births(tracks, frame_idx)
+                tracks = self._dedupe_tracks(tracks, frame_idx)
                 tracks = self._activate_tracks_by_court_mask(
                     tracks,
                     H,
                     frame.shape[:2],
                     frame_idx,
                 )
+                self._prev_tracks = list(tracks)
+                self._consume_lifecycle_alias_events(frame_idx)
+                tracks = self._apply_canonical_track_ids(tracks)
                 self._last_player_tracks = [t for t in tracks if not t["is_referee"]]
                 if self.config.debug.tracking:
-                    if self.config.detector.activate_tracks_by_court_mask:
-                        print(
-                            f"    [court-mask-debug] frame={frame_idx} "
-                            f"tracker_players={pre_activation_players} "
-                            f"active_players={len(self._last_player_tracks)} "
-                            f"pending_players={pre_activation_players - len(self._last_player_tracks)} "
-                            f"active_total={len(self._court_active_track_ids)}"
-                        )
                     self._log_id_debug(tracks, frame_idx)
 
                 if frame_idx % self.config.jersey.update_interval == 0 and tracks:
@@ -1132,3 +1421,65 @@ class BasketballTrackingPipeline:
             print(f"\nDone! Output:   {output_path}")
             print(f"     Tactical:  {tactical_path}")
             print(f"     Homography success: {self.homography_success_count}")
+
+        summary = self.tracker.get_lifecycle_summary()
+        for role, s in summary.items():
+            if not s.get("new") and not s.get("removed"):
+                continue
+            print(
+                f"\n  [{role}] lifecycle: "
+                f"new={s['new']} lost={s['lost']} rec={s['recovered']} "
+                f"rm={s['removed']} switches={s['switches']} | "
+                f"life avg={s['avg_life']:.0f}f med={s['median_life']}f p90={s['p90_life']}f"
+            )
+            if s["shortest_lived"]:
+                print(f"    shortest: {s['shortest_lived']}")
+            if s["most_recovered"]:
+                print(f"    most_recovered: {s['most_recovered']}")
+
+        if self.config.tracking_report_json:
+            import json
+            with open(self.config.tracking_report_json, "w") as f:
+                json.dump(summary, f, indent=2)
+            print(f"  Lifecycle report: {self.config.tracking_report_json}")
+
+        if self.config.debug.suppression and self._supp_det_pairs:
+            print("\n  [hold] Detection suppression pairs (≥5 consecutive or ≥10 total frames):")
+            reported = []
+            for (dropped, kept), frames in self._supp_det_pairs.items():
+                frames_sorted = sorted(set(frames))
+                max_run, cur_run, cur_start = 0, 1, frames_sorted[0]
+                run_start = run_end = frames_sorted[0]
+                for i in range(1, len(frames_sorted)):
+                    if frames_sorted[i] == frames_sorted[i - 1] + 1:
+                        cur_run += 1
+                    else:
+                        if cur_run > max_run:
+                            max_run, run_start, run_end = cur_run, cur_start, frames_sorted[i - 1]
+                        cur_run, cur_start = 1, frames_sorted[i]
+                if cur_run > max_run:
+                    max_run, run_start, run_end = cur_run, cur_start, frames_sorted[-1]
+                if max_run >= 5 or len(frames) >= 10:
+                    reported.append((dropped, kept, len(frames), max_run, run_start, run_end))
+            if reported:
+                reported.sort(key=lambda x: -x[3])
+                for dropped, kept, total, streak, sf, ef in reported:
+                    print(
+                        f"    (dropped~tid={dropped}, kept~tid={kept}): "
+                        f"total={total}f max_streak={streak}f (f={sf}-{ef})"
+                    )
+            else:
+                print("    (no persistent pairs found)")
+
+        if self.config.debug.suppression and self._supp_det_duplicate_pairs:
+            print("\n  [duplicate] Same-track detection suppressions:")
+            reported = []
+            for (dropped, kept), frames in self._supp_det_duplicate_pairs.items():
+                frames_sorted = sorted(set(frames))
+                reported.append((dropped, kept, len(frames), frames_sorted[0], frames_sorted[-1]))
+            reported.sort(key=lambda x: -x[2])
+            for dropped, kept, total, sf, ef in reported[:10]:
+                print(
+                    f"    (tid={dropped}, kept={kept}): "
+                    f"total={total}f span=f{sf}-{ef}"
+                )

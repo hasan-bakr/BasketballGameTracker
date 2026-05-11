@@ -18,26 +18,32 @@ class ClassConfig:
 @dataclass
 class DetectorConfig:
     rfdetr_model_id: str = RFDETRDetector.DEFAULT_MODEL_ID
-    confidence: float = 0.4
-    iou_threshold: float = 0.6
+    confidence: float = 0.3
+    iou_threshold: float = 0.4
     detection_nms_iou: float = 0.65
     cross_role_iou: float = 0.80
     track_nms_iou: float = 0.88
+    track_aware_suppression: bool = True
+    track_match_iou: float = 0.30
+    lost_track_match_iou: float = 0.20
+    lost_track_match_center_px: float = 160.0
+    duplicate_birth_max_dt: int = 3
+    duplicate_birth_max_dist: float = 40.0
     outside_court_existing_track_iou: float = 0.10
     outside_court_existing_track_center_px: float = 140.0
     activate_tracks_by_court_mask: bool = True
     court_mask_min_overlap: float = 0.12
-    court_mask_min_area_px: int = 120
+    court_mask_min_area_px: int = 0
 
 
 @dataclass
 class TrackerConfig:
     fps: int = 30
-    track_thresh: float = 0.6
+    track_thresh: float = 0.5
     new_track_thresh: float = 0.7
-    track_buffer: int = 90
-    cmc_method: str = "orb"
-    assoc1_thresh: float = 0.8
+    track_buffer: int = 120
+    cmc_method: str = "sparseOptFlow"
+    assoc1_thresh: float = 0.80
     assoc2_thresh: float = 0.5
     unconfirmed_assoc_thresh: float = 0.7
     mask_duplicate_min_fill: float = 0.45
@@ -50,6 +56,12 @@ class TrackerConfig:
     use_player_masks: bool = True
     use_referee_masks: bool = False
     require_cuda: bool = True
+    sam_model_type: str = "vit_b"
+    sam_checkpoint: Optional[str] = None
+    cutie_weights: Optional[str] = None
+    cutie_max_internal_size: int = 720
+    switch_proxy_max_dist: float = 80.0
+    switch_proxy_max_dt: int = 60
 
 
 @dataclass
@@ -87,6 +99,8 @@ class DebugConfig:
     progress_interval: int = 30
     id_jump_px: float = 90.0
     id_swap_px: float = 70.0
+    lifecycle: bool = False
+    suppression: bool = False
 
 
 @dataclass
@@ -112,3 +126,4 @@ class PipelineConfig:
     keypoints: KeypointConfig = field(default_factory=KeypointConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
+    tracking_report_json: Optional[str] = None
