@@ -17,11 +17,11 @@ Turkish documentation: [README_TR.md](README_TR.md)
 
 **Player tracking**
 
-<video src="https://github.com/user-attachments/assets/58786f0c-562e-4b5d-89ac-d41856fe7738" controls width="75%"></video>
+![Player tracking demo](media/demo_tracking.gif)
 
 **Tactical court view**
 
-<video src="https://github.com/user-attachments/assets/a1dda86d-07d1-4e90-ba1f-71374ad8c45a" controls width="30%"></video>
+![Tactical court view demo](media/demo_tactical.gif)
 
 ---
 
