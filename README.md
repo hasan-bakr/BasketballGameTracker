@@ -11,18 +11,13 @@ Turkish documentation: [README_TR.md](README_TR.md)
 
 ## Demo
 
-> Add the final GIFs before publishing:
->
-> - `media/demo_tracking.gif`
-> - `media/demo_tactical.gif`
-
 **Main tracking view**
 
-![Tracking demo](media/demo_tracking.gif)
+<video src="https://github.com/user-attachments/assets/0730f5e0-849e-4947-8b2b-817f860640a8" controls width="75%"></video>
 
 **Tactical court view**
 
-![Tactical demo](media/demo_tactical.gif)
+<video src="https://github.com/user-attachments/assets/cab1b58e-5c63-43d7-bd57-4b6f2614854a" controls width="30%"></video>
 
 ## Highlights
 
@@ -188,7 +183,6 @@ videos/output/LOG.log
 
 - Input videos, output videos, model weights, API keys, and local external repos are ignored by Git.
 - The tactical view depends on court keypoints. The pipeline carries recent keypoints and rejects unstable homography jumps to reduce visual teleporting.
-- Demo GIFs are intentionally not included yet. Add them under `media/` before publishing.
 
 ## Roadmap
 

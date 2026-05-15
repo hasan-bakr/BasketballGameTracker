@@ -44,6 +44,7 @@ videos/output/*
 !APP/assets/basketball_court.png
 !media/
 !media/*.gif
+!media/*.mp4
 !media/*.jpg
 !media/*.jpeg
 !media/*.png
