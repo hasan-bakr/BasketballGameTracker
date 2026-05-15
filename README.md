@@ -1,17 +1,21 @@
 # Basketball Game Tracker
 
-![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red)
-![CUDA](https://img.shields.io/badge/CUDA-recommended-76B900)
-![Status](https://img.shields.io/badge/Status-Active-brightgreen)
+<p align="left">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-blue" />
+  <img src="https://img.shields.io/badge/PyTorch-2.x-red" />
+  <img src="https://img.shields.io/badge/CUDA-recommended-76B900" />
+  <img src="https://img.shields.io/badge/Status-Active-brightgreen" />
+</p>
 
-Computer vision pipeline for basketball game footage. It detects players and referees, keeps player identities stable through crowded possessions, reads jersey numbers, and projects player positions onto a 2D tactical court view.
+A computer vision pipeline for basketball game footage. It detects and tracks players and referees frame-by-frame, reads jersey numbers, and projects every player's position onto a real-time 2D tactical court view.
 
 Turkish documentation: [README_TR.md](README_TR.md)
 
+---
+
 ## Demo
 
-**Main tracking view**
+**Player tracking**
 
 <video src="https://github.com/user-attachments/assets/0730f5e0-849e-4947-8b2b-817f860640a8" controls width="75%"></video>
 
@@ -19,103 +23,99 @@ Turkish documentation: [README_TR.md](README_TR.md)
 
 <video src="https://github.com/user-attachments/assets/cab1b58e-5c63-43d7-bd57-4b6f2614854a" controls width="30%"></video>
 
-## Highlights
+---
 
-- RF-DETR based player, referee, and jersey-region detection
-- MCByte multi-object tracking for stable player identities
-- SAM + Cutie mask propagation for mask-assisted association
-- Duplicate/phantom track suppression during occlusions
-- Jersey number OCR with PARSeq and a voting based Re-ID bank
-- YOLO-Pose court keypoints with RANSAC homography
-- Stabilized tactical projection with keypoint carry, side-switch handling, and motion smoothing
-- Separate annotated source video and tactical video outputs
+## Features
 
-## Models, Trackers, And Core Libraries
+- **Multi-object tracking** — RF-DETR detections fed into MCByte with SAM + Cutie mask propagation for stable player identities through contact and occlusion
+- **Jersey number OCR** — PARSeq reads jersey numbers from cropped regions; a voting bank stabilizes IDs across frames
+- **Tactical projection** — YOLO-Pose court keypoints + RANSAC homography maps each player's foot position onto a scaled court image in real time
+- **Duplicate suppression** — custom post-processing removes phantom and duplicate tracks caused by overlapping detections
+- **Two output videos** — annotated tracking view and a separate tactical court view
 
-| Component | Where It Is Used | Link |
-|---|---|---|
-| RF-DETR | Player, referee, ball, and jersey-region detections through the configured Roboflow model id. The default project id is `basketball-player-detection-3-ycjdo/4`. | [RF-DETR](https://github.com/roboflow/rf-detr) |
-| Roboflow Inference | Local/remote inference runtime for the RF-DETR detector. The `ROBOFLOW_API_KEY` value is loaded from `.env`. | [Roboflow Inference](https://github.com/roboflow/inference) |
-| MCByte | Main multi-object tracker. The project uses the local `external/mcbyte/` checkout and extends the mask-aware association flow with duplicate suppression, mask isolation, and lost-track reuse logic. | [MCByte](https://github.com/tstanczyk95/McByte), [paper](https://openaccess.thecvf.com/content/CVPR2025W/CVSPORTS/html/Stanczyk_No_Train_Yet_Gain_Towards_Generic_Multi-Object_Tracking_in_Sports_CVPRW_2025_paper.html) |
-| ByteTrack | Baseline tracking-by-detection association used by MCByte. | [ByteTrack](https://github.com/FoundationVision/ByteTrack) |
-| Segment Anything (SAM) | Creates initial masks from detector boxes before temporal propagation. The expected default weight is `external/mcbyte/sam_models/sam_vit_b_01ec64.pth`. | [Segment Anything](https://github.com/facebookresearch/segment-anything) |
-| Cutie | Video object segmentation model that propagates player masks across frames. The expected default weight is `external/mcbyte/mask_propagation/Cutie/weights/cutie-base-mega.pth`. | [Cutie](https://github.com/hkchengrex/Cutie) |
-| PARSeq | Jersey-number OCR through the local `parseq/` checkout and STRHub modules. | [PARSeq](https://github.com/baudm/parseq) |
-| Ultralytics YOLO Pose | Court keypoint detection for homography and tactical-view projection. The expected custom weight is `models/keypoints/yolo26l-fine-tuned.pt`. | [Ultralytics](https://github.com/ultralytics/ultralytics), [pose docs](https://docs.ultralytics.com/tasks/pose/) |
-| OpenCV | Homography estimation, perspective transforms, video I/O, drawing, and tactical-view rendering. | [OpenCV](https://opencv.org/) |
-| Supervision | Annotation helpers, colors, and detection utilities used by the visual output pipeline. | [Supervision](https://github.com/roboflow/supervision) |
-| PyTorch | Deep-learning runtime used by the detector, tracker dependencies, SAM, Cutie, PARSeq, and YOLO models. | [PyTorch](https://pytorch.org/) |
+---
 
-Supporting runtime and utility dependencies:
+## How It Works
 
-| Component | Where It Is Used | Link |
-|---|---|---|
-| NumPy / SciPy | Array operations, geometry calculations, and MCByte Kalman-filter math. | [NumPy](https://numpy.org/), [SciPy](https://scipy.org/) |
-| Pillow | Converts jersey crops to PIL images before PARSeq preprocessing. | [Pillow](https://python-pillow.org/) |
-| python-dotenv | Loads `.env` values such as `ROBOFLOW_API_KEY` without committing secrets. | [python-dotenv](https://github.com/theskumar/python-dotenv) |
-| LAP / FilterPy | Assignment and filtering helpers used by the MCByte tracking stack. | [lap](https://github.com/gatagat/lap), [FilterPy](https://github.com/rlabbe/filterpy) |
-| Hydra / OmegaConf | Configuration system used by the Cutie mask-propagation code. | [Hydra](https://hydra.cc/), [OmegaConf](https://omegaconf.readthedocs.io/) |
-| h5py / scikit-image / Hugging Face Hub | Model/checkpoint and image-processing utilities used by external model dependencies. | [h5py](https://www.h5py.org/), [scikit-image](https://scikit-image.org/), [Hugging Face Hub](https://huggingface.co/docs/huggingface_hub) |
-| tqdm | Progress bars used by external model utilities and scripts. | [tqdm](https://github.com/tqdm/tqdm) |
-
-## Pipeline
-
-```text
+```
 Input video
-    |
-    v
-RF-DETR detection
-    |
-    v
-MCByte tracking + SAM/Cutie mask propagation
-    |
-    v
-Jersey OCR and ID stabilization
-    |
-    v
-Court keypoints + homography
-    |
-    v
-Annotated video + tactical court video
+    │
+    ▼
+RF-DETR detection          (players, referees, jersey regions)
+    │
+    ▼
+MCByte tracking            (multi-object tracking with mask-aware association)
+ + SAM / Cutie             (segmentation masks for cleaner association)
+    │
+    ▼
+Jersey OCR                 (PARSeq on cropped jersey regions, voting bank)
+    │
+    ▼
+Court keypoints            (Roboflow YOLO-Pose model → RANSAC homography)
+    │
+    ▼
+Annotated video + Tactical court video
 ```
 
-## Repository Structure
+---
 
-```text
-APP/
-  __main__.py              CLI entry point
-  assets/
-    basketball_court.png   Tactical court image
-  helpers/
-    config.py              Central configuration
-    pipeline.py            End-to-end orchestration
-    mcbyte_tracker.py      MCByte and mask wrapper
-    rfdetr_detector.py     RF-DETR detector wrapper
-    jersey_detector.py     PARSeq OCR and jersey bank
-    court_utils.py         Homography and tactical rendering
-    team_detector.py       Team color utilities
-```
+## Models and Libraries
+
+### Detection and Tracking
+
+| Component | Role | Link |
+|---|---|---|
+| RF-DETR | Detects players, referees, and jersey regions via Roboflow Inference. Default model: `basketball-player-detection-3-ycjdo/4`. | [RF-DETR](https://github.com/roboflow/rf-detr) |
+| Roboflow Inference | Local inference runtime for RF-DETR. Requires `ROBOFLOW_API_KEY`. | [Roboflow Inference](https://github.com/roboflow/inference) |
+| MCByte | Multi-object tracker extended with duplicate suppression, mask isolation, and lost-track reuse. | [MCByte](https://github.com/tstanczyk95/McByte) · [paper](https://openaccess.thecvf.com/content/CVPR2025W/CVSPORTS/html/Stanczyk_No_Train_Yet_Gain_Towards_Generic_Multi-Object_Tracking_in_Sports_CVPRW_2025_paper.html) |
+| ByteTrack | Tracking-by-detection association base used by MCByte. | [ByteTrack](https://github.com/FoundationVision/ByteTrack) |
+| Segment Anything (SAM) | Generates initial masks from detector boxes. | [SAM](https://github.com/facebookresearch/segment-anything) |
+| Cutie | Propagates player masks across frames for temporal consistency. | [Cutie](https://github.com/hkchengrex/Cutie) |
+
+### Jersey OCR
+
+| Component | Role | Link |
+|---|---|---|
+| PARSeq | Reads jersey numbers from cropped regions. | [PARSeq](https://github.com/baudm/parseq) |
+
+### Court and Tactical View
+
+| Component | Role | Link |
+|---|---|---|
+| Roboflow YOLO-Pose | Detects 33 court keypoints per frame via Roboflow Inference. Default model: `basketball-court-detection-2/19`. | [Ultralytics](https://github.com/ultralytics/ultralytics) |
+| OpenCV | Homography estimation, perspective transforms, video I/O, drawing. | [OpenCV](https://opencv.org/) |
+
+### Supporting Libraries
+
+| Component | Role |
+|---|---|
+| PyTorch | Runtime for SAM, Cutie, PARSeq, and YOLO models. |
+| NumPy / SciPy | Array operations and Kalman-filter math used by MCByte. |
+| Supervision | Annotation helpers and detection utilities. |
+| Pillow | Converts jersey crops to PIL images for PARSeq. |
+| python-dotenv | Loads `ROBOFLOW_API_KEY` from `.env`. |
+| LAP / FilterPy | Assignment and filtering helpers for MCByte. |
+| Hydra / OmegaConf | Configuration system for Cutie. |
+
+---
 
 ## Requirements
 
-Recommended environment:
-
 - Python 3.11+
-- CUDA capable GPU
+- CUDA-capable GPU (recommended)
 - PyTorch 2.x
-- Roboflow API key for RF-DETR inference
+- A Roboflow API key (free tier is sufficient)
 
-Large model files and external research repos are not committed to Git. Place them locally before running the full pipeline.
+The following files must be placed locally before running — they are not committed to Git:
 
-Expected local assets:
-
-```text
-models/keypoints/yolo26l-fine-tuned.pt
-external/mcbyte/
-external/mcbyte/sam_models/sam_vit_b_01ec64.pth
-external/mcbyte/mask_propagation/Cutie/weights/cutie-base-mega.pth
-parseq/
 ```
+external/mcbyte/                                                  ← MCByte repo
+external/mcbyte/sam_models/sam_vit_b_01ec64.pth                  ← SAM weights
+external/mcbyte/mask_propagation/Cutie/weights/cutie-base-mega.pth  ← Cutie weights
+parseq/                                                           ← PARSeq repo
+```
+
+---
 
 ## Installation
 
@@ -130,63 +130,88 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
 
-Create an environment file:
+Create an environment file and add your Roboflow API key:
 
 ```bash
 cp .env.example .env
-```
-
-Then set:
-
-```bash
+# then edit .env:
 ROBOFLOW_API_KEY=your_key_here
 ```
+
+---
 
 ## Usage
 
 ```bash
 python -m APP \
-  --input videos/input/game.mp4 \
+  --input  videos/input/game.mp4 \
   --output videos/output/result.mp4 \
   --device cuda \
-  --max-frames 300
+  --max-frames 500
 ```
 
-The command creates:
+This produces:
 
-```text
-videos/output/result.mp4
-videos/output/result_tactical.mp4
-videos/output/LOG.log
+```
+videos/output/result.mp4           ← annotated tracking video
+videos/output/result_tactical.mp4  ← tactical court view
+videos/output/LOG.log              ← full run log
 ```
 
-## Useful CLI Flags
+### CLI Reference
 
-| Flag | Description |
-|---|---|
-| `--input` | Input video path |
-| `--output` | Annotated output video path |
-| `--max-frames` | Maximum processed frames |
-| `--start` | Start offset in seconds |
-| `--frame-skip` | Process every Nth frame |
-| `--device` | `cuda`, `cuda:0`, or `cpu` |
-| `--confidence` | Detector confidence override |
-| `--detector-iou` | RF-DETR internal NMS IoU override |
-| `--track-thresh` | MCByte high-score threshold |
-| `--new-track-thresh` | Minimum score for starting a new track |
-| `--debug` | Enable tracking, mask, and keypoint diagnostics |
-| `--debug-lifecycle` | Log track lifecycle events |
-| `--debug-suppression` | Log duplicate suppression and mask decisions |
-| `--tracking-report-json` | Write lifecycle summary JSON |
+| Flag | Default | Description |
+|---|---|---|
+| `--input` | — | Input video path (required) |
+| `--output` | — | Annotated output video path (required) |
+| `--max-frames` | 300 | Maximum frames to process |
+| `--start` | 0.8 | Start offset in seconds |
+| `--frame-skip` | 1 | Process every Nth frame |
+| `--device` | from config | `cuda`, `cuda:0`, or `cpu` |
+| `--confidence` | from config | Detector confidence threshold |
+| `--detector-iou` | from config | RF-DETR NMS IoU threshold |
+| `--track-thresh` | from config | MCByte high-score tracking threshold |
+| `--new-track-thresh` | from config | Minimum score to start a new track |
+| `--keypoint-backend` | from config | `roboflow` or `local` |
+| `--keypoint-model-id` | from config | Roboflow keypoint model ID override |
+| `--keypoint-confidence` | from config | Keypoint detection confidence |
+| `--debug` | off | Enable tracking, mask, and keypoint diagnostics |
+| `--debug-lifecycle` | off | Log per-frame track lifecycle events |
+| `--debug-suppression` | off | Log duplicate suppression decisions |
+| `--tracking-report-json` | — | Write lifecycle summary to JSON |
+
+---
+
+## Repository Structure
+
+```
+APP/
+  __main__.py              CLI entry point
+  assets/
+    basketball_court.png   Tactical court template image
+  helpers/
+    config.py              Central configuration dataclasses
+    pipeline.py            End-to-end pipeline orchestration
+    mcbyte_tracker.py      MCByte wrapper with mask and suppression logic
+    rfdetr_detector.py     RF-DETR / Roboflow Inference wrapper
+    jersey_detector.py     PARSeq OCR and jersey voting bank
+    court_utils.py         Homography, keypoint parsing, tactical rendering
+    team_detector.py       Team color clustering utilities
+```
+
+---
 
 ## Notes
 
-- Input videos, output videos, model weights, API keys, and local external repos are ignored by Git.
-- The tactical view depends on court keypoints. The pipeline carries recent keypoints and rejects unstable homography jumps to reduce visual teleporting.
+- All detection and keypoint inference runs through Roboflow Inference locally — no frames are sent to the cloud after the model is cached.
+- The tactical view degrades gracefully when court keypoints are partially visible: the pipeline carries the last reliable homography and rejects updates that cause large geometric jumps.
+- Input/output videos, model weights, API keys, and external repos are all Git-ignored.
+
+---
 
 ## Roadmap
 
 - Team possession and event-level analytics
-- Shot and ball-state integration
-- Speed and distance metrics
+- Shot detection and ball-state integration
+- Speed and distance metrics per player
 - Exportable match reports
