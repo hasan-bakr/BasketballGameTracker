@@ -91,16 +91,7 @@ def main():
     parser.add_argument("--device",     default=None,               help="Compute device override (default: from config)")
     parser.add_argument("--log-file",   default=None,               help="Verbose log path (default: output_dir/LOG.log)")
     parser.add_argument("--confidence", type=float, default=None,   help="Detector confidence override (default: from config)")
-    parser.add_argument("--detector-iou", type=float, default=None,
-                        help="RF-DETR internal NMS IoU override (higher keeps more overlapping boxes)")
-    parser.add_argument("--track-thresh", type=float, default=None, help="MCByte high-score tracking threshold override")
-    parser.add_argument("--new-track-thresh", type=float, default=None,
-                        help="MCByte threshold for starting a new track override")
-    parser.add_argument("--debug",      action="store_true",        help="Enable tracking/mask/keypoint diagnostics")
-    parser.add_argument("--debug-lifecycle", action="store_true",   help="Log per-frame track lifecycle events")
-    parser.add_argument("--debug-suppression", action="store_true", help="Log detection/track suppression and mask-cut events")
-    parser.add_argument("--track-aware-suppression", action=argparse.BooleanOptionalAction, default=None,
-                        help="Keep separate existing tracks through high-IoU contact (default: from config)")
+parser.add_argument("--debug",      action="store_true",        help="Enable tracking/mask/keypoint diagnostics")
     parser.add_argument("--tracking-report-json", default=None,     help="Write lifecycle summary JSON to this path")
     args = parser.parse_args()
 
@@ -141,12 +132,6 @@ def main():
                     config.debug.tracking = True
                     config.debug.masks = True
                     config.debug.keypoints = True
-                if args.debug_lifecycle:
-                    config.debug.lifecycle = True
-                if args.debug_suppression:
-                    config.debug.suppression = True
-                if args.track_aware_suppression is not None:
-                    config.detector.track_aware_suppression = args.track_aware_suppression
                 if args.tracking_report_json:
                     config.tracking_report_json = args.tracking_report_json
                 tracker = BasketballTrackingPipeline(config=config)
