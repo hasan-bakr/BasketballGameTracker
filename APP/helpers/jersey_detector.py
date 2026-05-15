@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
 # PARSeq imports
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "parseq"))
@@ -223,8 +223,8 @@ class JerseyReIDBank:
         # {obj_id: jersey_number}
         self.obj_to_jersey: Dict[int, str] = {}
         
-        # {jersey_number: obj_id} - Ters mapping
-        self.jersey_to_obj: Dict[str, int] = {}
+        # {jersey_number: [obj_id, ...]} - same number can belong to both teams
+        self.jersey_to_obj: Dict[str, List[int]] = {}
         
         # Her jersey için tespit sayısı (güvenilirlik için)
         self.detection_counts: Dict[int, Dict[str, int]] = {}  # {obj_id: {number: count}}
@@ -247,19 +247,23 @@ class JerseyReIDBank:
         if counts[best_number] >= 3:
             old_jersey = self.obj_to_jersey.get(obj_id)
 
+            MAX_PER_JERSEY = 2  # one per team; reject a third to guard against OCR noise
+
             if old_jersey != best_number:
-                # Bu numara zaten başka bir ID'ye kayıtlıysa, çakışmayı engelle
-                existing_owner = self.jersey_to_obj.get(best_number)
-                if existing_owner is not None and existing_owner != obj_id:
-                    return
+                # Remove obj_id from the old number's owner list
+                if old_jersey:
+                    old_owners = self.jersey_to_obj.get(old_jersey, [])
+                    if obj_id in old_owners:
+                        old_owners.remove(obj_id)
 
-                # Eski eşleştirmeyi kaldır
-                if old_jersey and self.jersey_to_obj.get(old_jersey) == obj_id:
-                    del self.jersey_to_obj[old_jersey]
+                # Register under new number, capped at MAX_PER_JERSEY
+                owners = self.jersey_to_obj.setdefault(best_number, [])
+                if obj_id not in owners:
+                    if len(owners) >= MAX_PER_JERSEY:
+                        return
+                    owners.append(obj_id)
 
-                # Yeni eşleştirmeyi kaydet
                 self.obj_to_jersey[obj_id] = best_number
-                self.jersey_to_obj[best_number] = obj_id
 
                 if self.verbose:
                     print(f"   Jersey registered: ID {obj_id} → #{best_number}")
@@ -268,7 +272,8 @@ class JerseyReIDBank:
         """
         Jersey numarasına göre obj_id bul.
         """
-        return self.jersey_to_obj.get(jersey_number)
+        owners = self.jersey_to_obj.get(jersey_number, [])
+        return owners[0] if owners else None
     
     def get_jersey(self, obj_id: int) -> Optional[str]:
         """

@@ -17,11 +17,11 @@ Basketbol maç videoları için bilgisayarlı görü pipeline'ı. Oyuncu ve hake
 
 **Oyuncu takibi**
 
-<video src="https://github.com/user-attachments/assets/0730f5e0-849e-4947-8b2b-817f860640a8" controls width="75%"></video>
+<video src="https://github.com/hasan-bakr/Basketball-Game-Tracker/releases/download/v1.0/demo_tracking.mp4" controls width="75%"></video>
 
 **Taktik saha görünümü**
 
-<video src="https://github.com/user-attachments/assets/cab1b58e-5c63-43d7-bd57-4b6f2614854a" controls width="30%"></video>
+<video src="https://github.com/hasan-bakr/Basketball-Game-Tracker/releases/download/v1.0/demo_tactical.mp4" controls width="30%"></video>
 
 ---
 

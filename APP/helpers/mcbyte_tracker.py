@@ -419,6 +419,15 @@ class _McByteStream:
         self._mask_missing_counts.pop(int(raw_id), None)
         self._mask_cut_fail_counts.pop(int(raw_id), None)
         self._forget_deferred_mask_request(raw_id)
+        self.events.append({
+            "type": "switch",
+            "frame": self.frame_id,
+            "lost": source_raw + self.track_id_offset,
+            "new": int(raw_id) + self.track_id_offset,
+            "reason": "mask_reuse",
+            "mask_id": int(mask_id),
+            "fill": float(fill_ratio),
+        })
         if self.config.debug_masks or self.config.debug_suppression:
             print(
                 f"    [mask-reuse f={self.frame_id}] "

@@ -19,7 +19,7 @@ from collections import defaultdict, deque
 import cv2
 import numpy as np
 import supervision as sv
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from ultralytics import YOLO
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,6 +31,9 @@ from APP.helpers.config import PipelineConfig
 from APP.helpers.court_utils import (
     TACTICAL_WIDTH, TACTICAL_HEIGHT, TACTICAL_KEYPOINTS,
     compute_homography, draw_keypoints_on_frame, draw_tactical_view,
+    build_minimal_court,
+    KP_NAMES, ROBOFLOW_COURT_KEYPOINT_LABELS, ROBOFLOW_LABEL_TO_TACTICAL_INDEX,
+    ROBOFLOW_TACTICAL_KEYPOINTS, ROBOFLOW_TO_TACTICAL_INDEX,
 )
 
 
@@ -50,6 +53,12 @@ def _track_color_bgr(track_id: int) -> Tuple[int, int, int]:
     h = ((int(track_id) % 60) * 0.618033988749895) % 1.0
     r, g, b = colorsys.hsv_to_rgb(h, 0.85, 0.95)
     return int(b * 255), int(g * 255), int(r * 255)
+
+
+def _get_field(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 # ── Geometry helper ────────────────────────────────────────────────────────────
@@ -221,28 +230,93 @@ class BasketballTrackingPipeline:
             f"area>={self.config.detector.court_mask_min_area_px}) "
         )
 
-        kp_path = self.config.keypoints.model_path
-        self.kp_model = YOLO(kp_path) if os.path.exists(kp_path) else None
-        if self.kp_model is None:
-            print(f"  Warning: keypoint model not found at {kp_path}")
+        self.kp_backend = str(self.config.keypoints.backend).lower()
+        self._roboflow_native_keypoints = self.kp_backend == "roboflow"
+        if self._roboflow_native_keypoints:
+            self._kp_len = len(ROBOFLOW_TACTICAL_KEYPOINTS)
+            self._kp_left_indices = [0, 1, 2, 3, 4, 5]
+            self._kp_right_indices = [27, 28, 29, 30, 31, 32]
+            self._kp_center_indices = [15, 16, 17]
+            self._kp_top_indices = [0, 15, 27]
+            self._kp_bottom_indices = [5, 17, 32]
+            self._kp_left_inner_indices = [9, 11]
+            self._kp_right_inner_indices = [21, 23]
+            self._kp_inner_indices = set(
+                self._kp_left_inner_indices + self._kp_right_inner_indices
+            )
+            self._base_tactical_dst = np.array(ROBOFLOW_TACTICAL_KEYPOINTS, dtype=np.float32)
+        else:
+            self._kp_len = len(TACTICAL_KEYPOINTS)
+            self._kp_left_indices = list(self.config.keypoints.left_indices)
+            self._kp_right_indices = list(self.config.keypoints.right_indices)
+            self._kp_center_indices = list(self.config.keypoints.center_indices)
+            self._kp_top_indices = list(self.config.keypoints.top_indices)
+            self._kp_bottom_indices = list(self.config.keypoints.bottom_indices)
+            self._kp_left_inner_indices = [8, 9]
+            self._kp_right_inner_indices = [16, 17]
+            self._kp_inner_indices = set(
+                self._kp_left_inner_indices + self._kp_right_inner_indices
+            )
+            self._base_tactical_dst = np.array(TACTICAL_KEYPOINTS, dtype=np.float32)
+
+        self.kp_model = None
+        if self.kp_backend == "roboflow":
+            self.kp_model = self._load_roboflow_keypoint_model()
+        else:
+            kp_path = self.config.keypoints.model_path
+            self.kp_model = YOLO(kp_path) if kp_path and os.path.exists(kp_path) else None
+            if self.kp_model is None:
+                print(f"  Warning: keypoint model not found at {kp_path}")
+            else:
+                print(f"  Court keypoints: local YOLO ({kp_path})")
 
         court_path = self.config.keypoints.court_image_path
-        if os.path.exists(court_path):
-            self.court_img = cv2.resize(cv2.imread(court_path), (TACTICAL_WIDTH, TACTICAL_HEIGHT))
+        if court_path and os.path.exists(court_path):
+            loaded = cv2.imread(court_path)
+            self.court_img = cv2.resize(loaded, (TACTICAL_WIDTH, TACTICAL_HEIGHT)) if loaded is not None else build_minimal_court()
         else:
-            self.court_img = np.ones((TACTICAL_HEIGHT, TACTICAL_WIDTH, 3), dtype=np.uint8) * 40
-            cv2.rectangle(self.court_img, (0, 0), (TACTICAL_WIDTH - 1, TACTICAL_HEIGHT - 1), (255, 255, 255), 1)
-            cv2.line(self.court_img, (TACTICAL_WIDTH // 2, 0), (TACTICAL_WIDTH // 2, TACTICAL_HEIGHT), (255, 255, 255), 1)
+            self.court_img = build_minimal_court()
 
         # Keypoint / homography state
         self.last_good_keypoints         = None
         self.last_H                      = None
         self._court_side: Optional[str]  = None
         self.homography_success_count    = 0
-        self._last_keypoints             = (np.zeros((18, 2), dtype=np.float32), np.zeros(18), None)
-        self._prev_detected_keypoints    = np.zeros((18, 2), dtype=np.float32)
-        self._keypoint_stationary_counts = np.zeros(18, dtype=np.int32)
-        self._keypoint_missing_counts    = np.full(18, self.config.keypoints.carry_missing_updates + 1, dtype=np.int32)
+        self._id_switch_count            = 0
+        self._last_keypoints             = (
+            np.zeros((self._kp_len, 2), dtype=np.float32),
+            np.zeros(self._kp_len),
+            None,
+        )
+        self._prev_detected_keypoints    = np.zeros((self._kp_len, 2), dtype=np.float32)
+        self._keypoint_stationary_counts = np.zeros(self._kp_len, dtype=np.int32)
+        self._keypoint_missing_counts    = np.full(
+            self._kp_len,
+            self.config.keypoints.carry_missing_updates + 1,
+            dtype=np.int32,
+        )
+
+        # Side-switch hysteresis and transition state
+        self._pending_side: Optional[str]  = None
+        self._pending_side_count: int      = 0
+        self._side_transition_frames: int  = 0
+        self._h_fallback_streak: int       = 0
+        self._last_center_kp_x: Optional[float] = None
+        self._force_homography_reseed: bool = False
+        self._last_H_mode: Optional[str] = None
+        self._tactical_dst_normal = self._base_tactical_dst.copy()
+        self._tactical_dst_mirrored = self._tactical_dst_normal.copy()
+        self._tactical_dst_mirrored[:, 0] = TACTICAL_WIDTH - self._tactical_dst_mirrored[:, 0]
+        self._prev_pan_keypoints = np.zeros((self._kp_len, 2), dtype=np.float32)
+        self._prev_pan_confidences = np.zeros(self._kp_len, dtype=np.float32)
+        self._prev_pan_frame_idx: Optional[int] = None
+        self._tactical_pan_prior_dx: float = 0.0
+        self._tactical_pan_prior_conf: float = 0.0
+        self._tactical_pan_prior_frame: int = -1
+        self._last_layout_side: Optional[str] = None
+        self._last_layout_slope: float = 0.0
+        self._last_layout_pairs: int = 0
+        self._rf_kp_schema_logged: bool = False
 
         self.locked_jersey_ids: set = set()
         self._track_id_alias: Dict[int, int] = {}
@@ -255,6 +329,8 @@ class BasketballTrackingPipeline:
             lambda: deque(maxlen=self.config.visualization.tactical_trail_length)
         )
         self._tactical_smoothed: Dict[int, Tuple[float, float]] = {}
+        self._tactical_last_seen: Dict[int, int] = {}
+
 
         # ── Supervision annotators ─────────────────────────────────────────────
         self._player_palette = _make_sv_palette(60)
@@ -295,14 +371,631 @@ class BasketballTrackingPipeline:
 
     # ── Warmup ─────────────────────────────────────────────────────────────────
 
+    def _load_roboflow_keypoint_model(self):
+        if not os.getenv("ROBOFLOW_API_KEY"):
+            raise SystemExit("ROBOFLOW_API_KEY env var is not set.")
+
+        for var in (
+            "PALIGEMMA_ENABLED", "FLORENCE2_ENABLED", "QWEN_2_5_ENABLED",
+            "QWEN_3_ENABLED", "CORE_MODEL_SAM_ENABLED", "CORE_MODEL_SAM3_ENABLED",
+            "CORE_MODEL_GAZE_ENABLED", "SMOLVLM2_ENABLED", "DEPTH_ESTIMATION_ENABLED",
+            "MOONDREAM2_ENABLED", "CORE_MODEL_TROCR_ENABLED", "CORE_MODEL_GROUNDINGDINO_ENABLED",
+        ):
+            os.environ.setdefault(var, "False")
+
+        try:
+            from inference import get_model
+        except ImportError as exc:
+            raise SystemExit(
+                "Missing dependency. Run: pip uninstall inference -y && pip install inference-gpu"
+            ) from exc
+
+        model_id = self.config.keypoints.roboflow_model_id
+        print(
+            "  Court keypoints: Roboflow "
+            f"{model_id} conf={self.config.keypoints.roboflow_confidence:.2f} "
+            f"anchor>={self.config.keypoints.anchor_confidence:.2f}"
+        )
+        return get_model(model_id=model_id)
+
     def _warmup(self):
         print("  Warming up models...", end=" ", flush=True)
         dummy = np.zeros((640, 640, 3), dtype=np.uint8)
         self.player_detector.detect(dummy, confidence_threshold=0.5)
-        if self.kp_model is not None:
+        if self.kp_model is not None and self.kp_backend == "roboflow":
+            self.kp_model.infer(dummy, confidence=self.config.keypoints.roboflow_confidence)
+        elif self.kp_model is not None:
             self.kp_model.predict(dummy, conf=self.config.keypoints.confidence, verbose=False,
                                   half=(self.device == "cuda"), device=self.device)
         print("done.")
+
+    def _homography_shift_stats(
+        self,
+        H: np.ndarray,
+        frame_shape: Tuple[int, int, int],
+    ) -> Tuple[float, float]:
+        if self.last_H is None:
+            return 0.0, 0.0
+        h, w = frame_shape[:2]
+        sample = np.array(
+            [
+                [0.0, 0.0],
+                [w * 0.5, 0.0],
+                [w - 1.0, 0.0],
+                [0.0, h * 0.5],
+                [w * 0.5, h * 0.5],
+                [w - 1.0, h * 0.5],
+                [0.0, h - 1.0],
+                [w * 0.5, h - 1.0],
+                [w - 1.0, h - 1.0],
+            ],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+        try:
+            prev = cv2.perspectiveTransform(sample, self.last_H).reshape(-1, 2)
+            cur = cv2.perspectiveTransform(sample, H).reshape(-1, 2)
+        except cv2.error:
+            return float("inf"), float("inf")
+        if not np.isfinite(prev).all() or not np.isfinite(cur).all():
+            return float("inf"), float("inf")
+        shifts = np.linalg.norm(cur - prev, axis=1)
+        return float(np.mean(shifts)), float(np.max(shifts))
+
+    @staticmethod
+    def _homography_reprojection_error(
+        keypoints_xy: np.ndarray,
+        H: np.ndarray,
+        dst_keypoints: np.ndarray,
+    ) -> float:
+        valid_indices = [
+            i for i in range(len(keypoints_xy))
+            if keypoints_xy[i][0] > 0 and keypoints_xy[i][1] > 0
+        ]
+        if len(valid_indices) < 4:
+            return float("inf")
+        src = np.array([keypoints_xy[i] for i in valid_indices], dtype=np.float32)
+        dst = np.array([dst_keypoints[i] for i in valid_indices], dtype=np.float32)
+        try:
+            projected = cv2.perspectiveTransform(src.reshape(-1, 1, 2), H).reshape(-1, 2)
+        except cv2.error:
+            return float("inf")
+        if not np.isfinite(projected).all():
+            return float("inf")
+        residuals = np.linalg.norm(projected - dst, axis=1)
+        return float(np.median(residuals))
+
+    @staticmethod
+    def _candidate_destination_side(
+        keypoints_xy: np.ndarray,
+        dst_keypoints: np.ndarray,
+    ) -> Optional[str]:
+        xs = [
+            float(dst_keypoints[i][0])
+            for i in range(len(keypoints_xy))
+            if keypoints_xy[i][0] > 0 and keypoints_xy[i][1] > 0
+        ]
+        if not xs:
+            return None
+        mean_x = sum(xs) / len(xs)
+        if mean_x < TACTICAL_WIDTH * 0.43:
+            return "left"
+        if mean_x > TACTICAL_WIDTH * 0.57:
+            return "right"
+        return "center"
+
+    def _select_homography_candidate(
+        self,
+        keypoints_xy: np.ndarray,
+        observed_side: Optional[str],
+        frame_shape: Tuple[int, int, int],
+        max_reproj_px: float,
+        use_stability: bool = True,
+    ) -> Tuple[Optional[np.ndarray], Optional[str], Dict[str, float | str]]:
+        candidates = []
+        for mode, dst_template in (
+            ("normal", self._tactical_dst_normal),
+            ("mirrored", self._tactical_dst_mirrored),
+        ):
+            H = compute_homography(
+                keypoints_xy,
+                max_reproj_px=max_reproj_px,
+                dst_keypoints=dst_template,
+            )
+            if H is None:
+                continue
+
+            reproj = self._homography_reprojection_error(keypoints_xy, H, dst_template)
+            mean_shift, max_shift = self._homography_shift_stats(H, frame_shape)
+            candidate_side = self._candidate_destination_side(keypoints_xy, dst_template)
+
+            score = reproj
+            if use_stability and self.last_H is not None:
+                score += mean_shift * self.config.keypoints.homography_stability_weight
+                score += max_shift * self.config.keypoints.homography_max_shift_weight
+                if (
+                    self._last_H_mode is not None
+                    and mode != self._last_H_mode
+                    and not self._force_homography_reseed
+                ):
+                    score += self.config.keypoints.homography_mode_switch_penalty
+            if observed_side in ("left", "right") and candidate_side in ("left", "right"):
+                if candidate_side != observed_side:
+                    score += self.config.keypoints.homography_side_penalty
+
+            candidates.append(
+                {
+                    "H": H,
+                    "mode": mode,
+                    "score": float(score),
+                    "reproj": float(reproj),
+                    "mean_shift": float(mean_shift),
+                    "max_shift": float(max_shift),
+                    "side": candidate_side or "-",
+                }
+            )
+
+        if not candidates:
+            return None, None, {}
+        candidates.sort(key=lambda item: item["score"])
+        best = candidates[0]
+        meta = {
+            "score": best["score"],
+            "reproj": best["reproj"],
+            "mean_shift": best["mean_shift"],
+            "max_shift": best["max_shift"],
+            "side": best["side"],
+        }
+        return best["H"], str(best["mode"]), meta
+
+    def _update_keypoint_pan_prior(
+        self,
+        keypoints_xy: np.ndarray,
+        confidences: np.ndarray,
+        frame_width: int,
+        frame_idx: Optional[int],
+    ) -> Tuple[float, float, int, float]:
+        cfg = self.config.visualization
+        if not cfg.tactical_pan_prior_enabled:
+            return 0.0, 0.0, 0, 0.0
+
+        current_frame = -1 if frame_idx is None else int(frame_idx)
+        valid = (
+            (keypoints_xy > 0).all(axis=1)
+            & (confidences >= self.config.keypoints.geometry_confidence)
+        )
+        prev_valid = (
+            (self._prev_pan_keypoints > 0).all(axis=1)
+            & (self._prev_pan_confidences >= self.config.keypoints.geometry_confidence)
+        )
+        matched = valid & prev_valid
+        matched_count = int(np.count_nonzero(matched))
+
+        prior_dx = 0.0
+        prior_conf = 0.0
+        median_dx = 0.0
+        mad_dx = 0.0
+
+        if matched_count >= cfg.tactical_pan_prior_min_keypoints and self._prev_pan_frame_idx is not None:
+            dt = max(1, current_frame - int(self._prev_pan_frame_idx))
+            dxs = keypoints_xy[matched, 0] - self._prev_pan_keypoints[matched, 0]
+            median_dx = float(np.median(dxs))
+            mad_dx = float(np.median(np.abs(dxs - median_dx)))
+
+            if abs(median_dx) >= cfg.tactical_pan_prior_min_image_px:
+                median_sign = 1.0 if median_dx > 0 else -1.0
+                agreement = float(np.mean(np.sign(dxs) == median_sign))
+                mad_quality = max(0.0, 1.0 - mad_dx / max(cfg.tactical_pan_prior_max_mad_px, 1e-6))
+                prior_conf = agreement * mad_quality
+                if mad_dx <= cfg.tactical_pan_prior_max_mad_px and prior_conf >= cfg.tactical_pan_prior_min_conf:
+                    image_dx_per_frame = median_dx / dt
+                    court_scale = TACTICAL_WIDTH / max(float(frame_width), 1.0)
+                    prior_dx = -image_dx_per_frame * court_scale * cfg.tactical_pan_prior_gain
+
+        if prior_conf >= cfg.tactical_pan_prior_min_conf:
+            self._tactical_pan_prior_dx = (
+                self._tactical_pan_prior_dx * 0.55 + prior_dx * 0.45
+                if self._tactical_pan_prior_conf >= cfg.tactical_pan_prior_min_conf
+                else prior_dx
+            )
+            self._tactical_pan_prior_conf = prior_conf
+            self._tactical_pan_prior_frame = current_frame
+        else:
+            self._tactical_pan_prior_dx *= 0.75
+            self._tactical_pan_prior_conf *= 0.75
+            if abs(self._tactical_pan_prior_dx) < 0.05:
+                self._tactical_pan_prior_dx = 0.0
+                self._tactical_pan_prior_conf = 0.0
+
+        self._prev_pan_keypoints = keypoints_xy.copy()
+        self._prev_pan_confidences = confidences.copy()
+        self._prev_pan_frame_idx = current_frame
+
+        return self._tactical_pan_prior_dx, self._tactical_pan_prior_conf, matched_count, mad_dx
+
+    def _current_tactical_dst_template(
+        self,
+        keypoints_xy: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        target_side = self._last_layout_side or self._court_side
+        if keypoints_xy is not None and target_side in ("left", "right"):
+            normal_side = self._candidate_destination_side(keypoints_xy, self._tactical_dst_normal)
+            mirrored_side = self._candidate_destination_side(keypoints_xy, self._tactical_dst_mirrored)
+            if normal_side == target_side:
+                return self._tactical_dst_normal
+            if mirrored_side == target_side:
+                return self._tactical_dst_mirrored
+        return self._tactical_dst_mirrored if self._last_H_mode == "mirrored" else self._tactical_dst_normal
+
+    def _relative_tactical_projection(
+        self,
+        foot_pt: List[float],
+        keypoints_xy: Optional[np.ndarray],
+        confidences: Optional[np.ndarray],
+    ) -> Tuple[Optional[Tuple[float, float]], int]:
+        cfg = self.config.visualization
+        if not cfg.tactical_relative_projection or keypoints_xy is None:
+            return None, 0
+
+        valid_indices = []
+        for idx in range(len(keypoints_xy)):
+            if keypoints_xy[idx][0] <= 0 or keypoints_xy[idx][1] <= 0:
+                continue
+            valid_indices.append(idx)
+
+        if len(valid_indices) < cfg.tactical_relative_min_keypoints:
+            return None, len(valid_indices)
+
+        src = np.array([keypoints_xy[i] for i in valid_indices], dtype=np.float32)
+        dst_template = self._current_tactical_dst_template(keypoints_xy)
+        dst = np.array([dst_template[i] for i in valid_indices], dtype=np.float32)
+        foot = np.array(foot_pt, dtype=np.float32)
+
+        dists = np.linalg.norm(src - foot.reshape(1, 2), axis=1)
+        order = np.argsort(dists)
+        nearest = order[:max(1, min(cfg.tactical_relative_nearest_keypoints, len(order)))]
+
+        nearest_dists = dists[nearest]
+        weights = 1.0 / np.power(nearest_dists + 1.0, cfg.tactical_relative_power)
+
+        if confidences is not None and len(confidences) >= len(keypoints_xy):
+            conf = np.array([float(confidences[valid_indices[i]]) for i in nearest], dtype=np.float32)
+            conf = np.clip(conf, cfg.tactical_relative_conf_floor, 1.0)
+            weights *= conf
+
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-6:
+            return None, len(valid_indices)
+
+        projected = np.sum(dst[nearest] * weights.reshape(-1, 1), axis=0) / weight_sum
+        px = float(np.clip(projected[0], 0, TACTICAL_WIDTH - 1))
+        py = float(np.clip(projected[1], 0, TACTICAL_HEIGHT - 1))
+        return (px, py), len(valid_indices)
+
+    def _project_player_to_tactical(
+        self,
+        foot_pt: List[float],
+        H: Optional[np.ndarray],
+        keypoints_xy: Optional[np.ndarray],
+        confidences: Optional[np.ndarray],
+    ) -> Optional[Dict[str, float | str | int]]:
+        cfg = self.config.visualization
+        h_point = None
+        h_inside = False
+        raw_px = raw_py = 0.0
+
+        if H is not None:
+            try:
+                dst = cv2.perspectiveTransform(np.array([[foot_pt]], dtype=np.float32), H)
+                raw_px = float(dst[0][0][0])
+                raw_py = float(dst[0][0][1])
+                h_inside = (
+                    -cfg.tactical_out_of_bounds_margin_px <= raw_px <= TACTICAL_WIDTH + cfg.tactical_out_of_bounds_margin_px
+                    and -cfg.tactical_out_of_bounds_margin_px <= raw_py <= TACTICAL_HEIGHT + cfg.tactical_out_of_bounds_margin_px
+                )
+                h_point = (
+                    float(np.clip(raw_px, 0, TACTICAL_WIDTH - 1)),
+                    float(np.clip(raw_py, 0, TACTICAL_HEIGHT - 1)),
+                )
+            except cv2.error:
+                h_point = None
+
+        rel_point, rel_count = self._relative_tactical_projection(foot_pt, keypoints_xy, confidences)
+        if h_point is None and rel_point is None:
+            return None
+
+        if h_point is None:
+            px, py = rel_point
+            raw_px, raw_py = px, py
+            source = "relative"
+        elif rel_point is None:
+            if not h_inside:
+                return None
+            px, py = h_point
+            source = "H"
+        elif h_inside:
+            px, py = h_point
+            source = "H"
+        else:
+            blend = cfg.tactical_relative_outside_blend
+            px = h_point[0] * (1.0 - blend) + rel_point[0] * blend
+            py = h_point[1] * (1.0 - blend) + rel_point[1] * blend
+            px = float(np.clip(px, 0, TACTICAL_WIDTH - 1))
+            py = float(np.clip(py, 0, TACTICAL_HEIGHT - 1))
+            source = "relative-guard"
+
+        return {
+            "x": float(px),
+            "y": float(py),
+            "raw_x": float(raw_px),
+            "raw_y": float(raw_py),
+            "source": source,
+            "relative_keypoints": int(rel_count),
+        }
+
+    @staticmethod
+    def _normalise_inference_result(result: Any) -> Any:
+        if isinstance(result, (list, tuple)) and result:
+            return result[0]
+        return result
+
+    @staticmethod
+    def _prediction_keypoints(prediction: Any) -> List[Any]:
+        keypoints = _get_field(prediction, "keypoints", None)
+        if keypoints is None:
+            return []
+        if isinstance(keypoints, dict):
+            for nested_key in ("items", "predictions", "keypoints"):
+                nested = keypoints.get(nested_key)
+                if isinstance(nested, list):
+                    return nested
+            return list(keypoints.values())
+        try:
+            return list(keypoints)
+        except TypeError:
+            nested = _get_field(keypoints, "keypoints", None)
+            if nested is not None and nested is not keypoints:
+                try:
+                    return list(nested)
+                except TypeError:
+                    return []
+            return []
+
+    def _keypoint_index(self, keypoint: Any, fallback: int) -> int:
+        raw_idx = _get_field(keypoint, "class_id", None)
+        if raw_idx is None:
+            raw_idx = _get_field(keypoint, "class", None)
+        if raw_idx is None:
+            raw_idx = _get_field(keypoint, "class_name", None)
+
+        idx = None
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            if isinstance(raw_idx, str):
+                digits = "".join(ch for ch in raw_idx if ch.isdigit())
+                if digits:
+                    try:
+                        idx = int(digits)
+                    except ValueError:
+                        idx = None
+
+        if idx is None:
+            idx = fallback
+        else:
+            idx -= int(self.config.keypoints.keypoint_index_base)
+        return int(idx)
+
+    @staticmethod
+    def _field_as_str(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text if text else None
+
+    @staticmethod
+    def _confidence_value(keypoint: Any) -> float:
+        confidence = _get_field(keypoint, "confidence", None)
+        if confidence is None:
+            confidence = _get_field(keypoint, "conf", 1.0)
+        try:
+            return float(confidence)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _roboflow_raw_keypoint_index(self, keypoint: Any, fallback: int) -> int:
+        raw_idx = _get_field(keypoint, "class_id", None)
+        if raw_idx is None:
+            raw_idx = _get_field(keypoint, "class", None)
+        if raw_idx is None:
+            raw_idx = _get_field(keypoint, "keypoint_id", None)
+
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            idx = fallback
+        return idx - int(self.config.keypoints.keypoint_index_base)
+
+    def _roboflow_keypoint_label(self, keypoint: Any, fallback_idx: int) -> Optional[str]:
+        for field in ("class_name", "name", "label"):
+            label = self._field_as_str(_get_field(keypoint, field, None))
+            if label is not None:
+                if label.isdigit():
+                    return label.zfill(2)
+                digits = "".join(ch for ch in label if ch.isdigit())
+                if digits:
+                    return digits.zfill(2)
+        raw_idx = self._roboflow_raw_keypoint_index(keypoint, fallback_idx)
+        if 0 <= raw_idx < len(ROBOFLOW_COURT_KEYPOINT_LABELS):
+            return ROBOFLOW_COURT_KEYPOINT_LABELS[raw_idx]
+        return None
+
+    def _roboflow_native_index(self, keypoint: Any, fallback_idx: int) -> int:
+        label = self._roboflow_keypoint_label(keypoint, fallback_idx)
+        if label in ROBOFLOW_COURT_KEYPOINT_LABELS:
+            return ROBOFLOW_COURT_KEYPOINT_LABELS.index(label)
+        raw_idx = self._roboflow_raw_keypoint_index(keypoint, fallback_idx)
+        if 0 <= raw_idx < len(ROBOFLOW_COURT_KEYPOINT_LABELS):
+            return raw_idx
+        return -1
+
+    def _roboflow_tactical_index(self, keypoint: Any, fallback_idx: int) -> int:
+        label = self._roboflow_keypoint_label(keypoint, fallback_idx)
+        if label in ROBOFLOW_LABEL_TO_TACTICAL_INDEX:
+            return int(ROBOFLOW_LABEL_TO_TACTICAL_INDEX[label])
+        raw_idx = self._roboflow_raw_keypoint_index(keypoint, fallback_idx)
+        if 0 <= raw_idx < len(ROBOFLOW_TO_TACTICAL_INDEX):
+            return int(ROBOFLOW_TO_TACTICAL_INDEX[raw_idx])
+        return -1
+
+    def _log_roboflow_keypoint_schema(self, raw_keypoints: List[Any]) -> None:
+        if self._rf_kp_schema_logged or not self.config.debug.keypoints:
+            return
+        self._rf_kp_schema_logged = True
+        print(
+            "    [rf-kp-schema] "
+            f"raw={len(raw_keypoints)} "
+            f"labels={','.join(ROBOFLOW_COURT_KEYPOINT_LABELS)}"
+        )
+        for fallback_idx, keypoint in enumerate(raw_keypoints[:len(ROBOFLOW_COURT_KEYPOINT_LABELS)]):
+            raw_idx = self._roboflow_raw_keypoint_index(keypoint, fallback_idx)
+            native_idx = self._roboflow_native_index(keypoint, fallback_idx)
+            label = self._roboflow_keypoint_label(keypoint, fallback_idx) or "-"
+            legacy_idx = self._roboflow_tactical_index(keypoint, fallback_idx)
+            legacy_name = KP_NAMES[legacy_idx] if 0 <= legacy_idx < len(KP_NAMES) else "-"
+            x = _get_field(keypoint, "x", None)
+            y = _get_field(keypoint, "y", None)
+            try:
+                x_text = f"{float(x):.1f}"
+                y_text = f"{float(y):.1f}"
+            except (TypeError, ValueError):
+                x_text = "-"
+                y_text = "-"
+            print(
+                "    [rf-kp-schema] "
+                f"raw_idx={raw_idx:02d} label={label} "
+                f"xy=({x_text},{y_text}) conf={self._confidence_value(keypoint):.3f} "
+                f"native={native_idx} legacy={legacy_idx}:{legacy_name}"
+            )
+
+    def _parse_roboflow_keypoints_direct(self, result: Any) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+        result = self._normalise_inference_result(result)
+        predictions = _get_field(result, "predictions", [])
+        if isinstance(predictions, dict):
+            nested = predictions.get("predictions") or predictions.get("items")
+            predictions = nested if nested is not None else [predictions]
+        predictions = list(predictions) if predictions is not None else []
+
+        best_xy = np.zeros((self._kp_len, 2), dtype=np.float32)
+        best_conf = np.zeros(self._kp_len, dtype=np.float32)
+        best_score = -1.0
+        best_debug = {"boxes": len(predictions), "instances": 0, "raw_keypoints": 0}
+
+        for prediction in predictions:
+            raw_keypoints = self._prediction_keypoints(prediction)
+            if not raw_keypoints:
+                continue
+            self._log_roboflow_keypoint_schema(raw_keypoints)
+            xy = np.zeros((self._kp_len, 2), dtype=np.float32)
+            conf = np.zeros(self._kp_len, dtype=np.float32)
+            for fallback_idx, keypoint in enumerate(raw_keypoints):
+                if self._roboflow_native_keypoints:
+                    idx = self._roboflow_native_index(keypoint, fallback_idx)
+                else:
+                    idx = self._roboflow_tactical_index(keypoint, fallback_idx)
+                if idx < 0 or idx >= self._kp_len:
+                    continue
+                x = _get_field(keypoint, "x", None)
+                y = _get_field(keypoint, "y", None)
+                if x is None or y is None:
+                    continue
+                conf_value = self._confidence_value(keypoint)
+                xy[idx] = (float(x), float(y))
+                conf[idx] = conf_value
+
+            valid_count = int(((xy > 0).all(axis=1) & (conf >= self.config.keypoints.geometry_confidence)).sum())
+            score = valid_count + float(conf.sum()) * 0.01
+            if score > best_score:
+                best_score = score
+                best_xy = xy
+                best_conf = conf
+                best_debug = {
+                    "boxes": len(predictions),
+                    "instances": 1,
+                    "raw_keypoints": len(raw_keypoints),
+                }
+
+        return best_xy, best_conf, best_debug
+
+    def _parse_roboflow_keypoints_supervision(self, result: Any) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+        result = self._normalise_inference_result(result)
+        try:
+            key_points = sv.KeyPoints.from_inference(result)
+        except Exception:
+            return np.zeros((self._kp_len, 2), dtype=np.float32), np.zeros(self._kp_len, dtype=np.float32), {
+                "boxes": 0,
+                "instances": 0,
+                "raw_keypoints": 0,
+            }
+
+        xy_all = np.asarray(getattr(key_points, "xy", []), dtype=np.float32)
+        conf_all = getattr(key_points, "confidence", None)
+        if xy_all.size == 0:
+            return np.zeros((self._kp_len, 2), dtype=np.float32), np.zeros(self._kp_len, dtype=np.float32), {
+                "boxes": 0,
+                "instances": 0,
+                "raw_keypoints": 0,
+            }
+
+        if xy_all.ndim == 2:
+            xy_all = xy_all.reshape(1, xy_all.shape[0], xy_all.shape[1])
+        if conf_all is None:
+            conf_all = np.ones(xy_all.shape[:2], dtype=np.float32)
+        else:
+            conf_all = np.asarray(conf_all, dtype=np.float32)
+            if conf_all.ndim == 1:
+                conf_all = conf_all.reshape(1, conf_all.shape[0])
+
+        n_scored = min(len(ROBOFLOW_TO_TACTICAL_INDEX), conf_all.shape[1])
+        mapped_raw = np.array(
+            [idx for idx, mapped in enumerate(ROBOFLOW_TO_TACTICAL_INDEX[:n_scored]) if mapped >= 0],
+            dtype=np.int32,
+        )
+        if self._roboflow_native_keypoints:
+            scores = np.sum(conf_all >= self.config.keypoints.geometry_confidence, axis=1)
+        elif len(mapped_raw) > 0:
+            scores = np.sum(conf_all[:, mapped_raw] >= self.config.keypoints.geometry_confidence, axis=1)
+        else:
+            scores = np.sum(conf_all >= self.config.keypoints.geometry_confidence, axis=1)
+        best_idx = int(np.argmax(scores))
+        raw_xy = xy_all[best_idx]
+        raw_conf = conf_all[best_idx]
+
+        xy = np.zeros((self._kp_len, 2), dtype=np.float32)
+        conf = np.zeros(self._kp_len, dtype=np.float32)
+        if self._roboflow_native_keypoints:
+            n = min(self._kp_len, len(raw_xy), len(raw_conf))
+            xy[:n] = raw_xy[:n]
+            conf[:n] = raw_conf[:n]
+        else:
+            n = min(len(ROBOFLOW_TO_TACTICAL_INDEX), len(raw_xy), len(raw_conf))
+            for raw_idx in range(n):
+                tactical_idx = ROBOFLOW_TO_TACTICAL_INDEX[raw_idx]
+                if tactical_idx < 0 or tactical_idx >= self._kp_len:
+                    continue
+                xy[tactical_idx] = raw_xy[raw_idx]
+                conf[tactical_idx] = raw_conf[raw_idx]
+        return xy, conf, {
+            "boxes": int(len(xy_all)),
+            "instances": int(len(xy_all)),
+            "raw_keypoints": int(len(raw_xy)),
+        }
+
+    def _infer_roboflow_keypoints(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+        result = self.kp_model.infer(frame, confidence=self.config.keypoints.roboflow_confidence)
+        xy, conf, debug = self._parse_roboflow_keypoints_direct(result)
+        if int((xy > 0).all(axis=1).sum()) > 0:
+            return xy, conf, debug
+        return self._parse_roboflow_keypoints_supervision(result)
 
     # ── Court keypoint detection ───────────────────────────────────────────────
 
@@ -313,30 +1006,44 @@ class BasketballTrackingPipeline:
         src_idx: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         if self.kp_model is None:
-            return np.zeros((18, 2), dtype=np.float32), np.zeros(18), self.last_H
+            return (
+                np.zeros((self._kp_len, 2), dtype=np.float32),
+                np.zeros(self._kp_len, dtype=np.float32),
+                self.last_H,
+            )
 
-        results = self.kp_model.predict(
-            frame, conf=self.config.keypoints.confidence, verbose=False,
-            half=(self.device == "cuda"), device=self.device,
-        )
-        keypoints_xy = np.zeros((18, 2), dtype=np.float32)
-        confidences  = np.zeros(18, dtype=np.float32)
+        keypoints_xy = np.zeros((self._kp_len, 2), dtype=np.float32)
+        confidences = np.zeros(self._kp_len, dtype=np.float32)
         debug_boxes = 0
         debug_instances = 0
+        debug_raw_keypoints = 0
 
-        if results and results[0].keypoints is not None:
-            boxes = getattr(results[0], "boxes", None)
-            if boxes is not None:
-                debug_boxes = len(boxes)
-            kp = results[0].keypoints
-            if kp.xy is not None and len(kp.xy) > 0:
-                debug_instances = len(kp.xy)
-                xy = kp.xy[0].cpu().numpy()
-                keypoints_xy[:min(len(xy), 18)] = xy[:18]
-                if kp.conf is not None and len(kp.conf) > 0:
-                    conf = kp.conf[0].cpu().numpy()
-                    n = min(len(conf), 18)
-                    confidences[:n] = conf[:n]
+        if self.kp_backend == "roboflow":
+            keypoints_xy, confidences, kp_debug = self._infer_roboflow_keypoints(frame)
+            debug_boxes = int(kp_debug.get("boxes", 0))
+            debug_instances = int(kp_debug.get("instances", 0))
+            debug_raw_keypoints = int(kp_debug.get("raw_keypoints", 0))
+        else:
+            results = self.kp_model.predict(
+                frame, conf=self.config.keypoints.confidence, verbose=False,
+                half=(self.device == "cuda"), device=self.device,
+            )
+
+            if results and results[0].keypoints is not None:
+                boxes = getattr(results[0], "boxes", None)
+                if boxes is not None:
+                    debug_boxes = len(boxes)
+                kp = results[0].keypoints
+                if kp.xy is not None and len(kp.xy) > 0:
+                    debug_instances = len(kp.xy)
+                    xy = kp.xy[0].cpu().numpy()
+                    debug_raw_keypoints = len(xy)
+                    n = min(len(xy), self._kp_len)
+                    keypoints_xy[:n] = xy[:n]
+                    if kp.conf is not None and len(kp.conf) > 0:
+                        conf = kp.conf[0].cpu().numpy()
+                        n = min(len(conf), self._kp_len)
+                        confidences[:n] = conf[:n]
 
         raw_valid_count = int(((keypoints_xy > 0).all(axis=1)).sum())
         raw_conf_01 = int((confidences >= 0.1).sum())
@@ -357,35 +1064,64 @@ class BasketballTrackingPipeline:
             by = h * self.config.keypoints.edge_band_ratio
             return x <= bx or x >= (w - bx) or y <= by or y >= (h - by)
 
-        for i in range(18):
+        for i in range(self._kp_len):
             if not _valid(keypoints_xy[i]):
                 keypoints_xy[i] = 0.0
 
-        observed_side, side_counts = self._detected_court_side(keypoints_xy, confidences)
+        observed_side, side_counts = self._detected_court_side(keypoints_xy, confidences, frame.shape[1])
         side_switched = False
-        if observed_side is not None and self._court_side is not None and observed_side != self._court_side:
+
+        # Hysteresis: require N consecutive frames before accepting a side change
+        if observed_side is None or observed_side == "center" or observed_side == self._court_side:
+            self._pending_side = None
+            self._pending_side_count = 0
+        elif observed_side == self._pending_side:
+            self._pending_side_count += 1
+        else:
+            self._pending_side = observed_side
+            self._pending_side_count = 1
+
+        if (
+            self._court_side is not None
+            and self._pending_side is not None
+            and self._pending_side_count >= self.config.keypoints.side_switch_hysteresis_frames
+        ):
             side_switched = True
             old_side = self._court_side
-            self._court_side = None
-            self.last_good_keypoints = None
-            self.last_H = None
-            self._prev_detected_keypoints[:] = 0.0
-            self._keypoint_stationary_counts[:] = 0
-            self._keypoint_missing_counts[:] = self.config.keypoints.carry_missing_updates + 1
-            self._tactical_history.clear()
-            self._tactical_smoothed.clear()
+            confirmed_side = self._pending_side
+            self._pending_side = None
+            self._pending_side_count = 0
+            self._court_side = confirmed_side
+
+            # Soft reset: only wipe the departing side's keypoints; keep the rest
+            left_ft = set(self._kp_left_indices) | set(self._kp_left_inner_indices)
+            right_ft = set(self._kp_right_indices) | set(self._kp_right_inner_indices)
+            wipe_idx = left_ft if old_side == "left" else right_ft if old_side == "right" else set()
+            carry = self.config.keypoints.carry_missing_updates + 1
+            if self.last_good_keypoints is not None:
+                for i in wipe_idx:
+                    self.last_good_keypoints[i] = 0.0
+            for i in wipe_idx:
+                self._prev_detected_keypoints[i] = 0.0
+                self._keypoint_stationary_counts[i] = 0
+                self._keypoint_missing_counts[i] = carry
+
+            # Mark transition so _accept_homography_update uses stricter thresholds
+            self._side_transition_frames = self.config.keypoints.side_transition_frames
+            self._force_homography_reseed = True
+
             if self.config.debug.keypoints:
                 frame_label = "-" if frame_idx is None else str(frame_idx)
                 src_label = "-" if src_idx is None else str(src_idx)
                 print(
                     f"    [kp-side-switch] frame={frame_label} src={src_label} "
-                    f"{old_side}->{observed_side} "
+                    f"{old_side}->{confirmed_side} "
                     f"left={side_counts[0]} center={side_counts[1]} right={side_counts[2]}"
                 )
 
         if self.last_good_keypoints is not None:
             valid_pairs = [
-                i for i in range(18)
+                i for i in range(self._kp_len)
                 if _valid(keypoints_xy[i]) and _valid(self.last_good_keypoints[i])
             ]
             if valid_pairs:
@@ -399,7 +1135,7 @@ class BasketballTrackingPipeline:
                     self._keypoint_stationary_counts[:] = 0
                     self._keypoint_missing_counts[:] = self.config.keypoints.carry_missing_updates + 1
 
-        for i in range(18):
+        for i in range(self._kp_len):
             pt   = keypoints_xy[i]
             prev = self._prev_detected_keypoints[i]
             if not _valid(pt):
@@ -415,23 +1151,41 @@ class BasketballTrackingPipeline:
                 keypoints_xy[i] = 0.0
                 confidences[i]  = 0.0
 
+        max_reproj = self.config.keypoints.compute_homography_max_reproj_px
         high_conf = np.where(
             (confidences >= self.config.keypoints.geometry_confidence).reshape(-1, 1) & (keypoints_xy > 0),
             keypoints_xy, 0.0,
         ).astype(np.float32)
-        pre_H = compute_homography(high_conf) if (high_conf > 0).any() else None
+        pre_H = None
+        pre_mode = None
+        if (high_conf > 0).any():
+            pre_H, pre_mode, _ = self._select_homography_candidate(
+                high_conf,
+                observed_side,
+                frame.shape,
+                max_reproj,
+                use_stability=False,
+            )
         if pre_H is not None:
-            for i in range(18):
+            pre_dst = self._tactical_dst_mirrored if pre_mode == "mirrored" else self._tactical_dst_normal
+            for i in range(self._kp_len):
                 if keypoints_xy[i][0] <= 0:
                     continue
                 dst = cv2.perspectiveTransform(np.array([[keypoints_xy[i]]], dtype=np.float32), pre_H)
                 tx, ty = dst[0][0]
-                ex, ey = TACTICAL_KEYPOINTS[i]
+                ex, ey = pre_dst[i]
                 if np.sqrt((tx - ex) ** 2 + (ty - ey) ** 2) > 50:
                     keypoints_xy[i] = 0.0
 
-        detected_this_update = np.array([_valid(keypoints_xy[i]) for i in range(18)], dtype=bool)
-        for i in range(18):
+        pan_dx, pan_conf, pan_matches, pan_mad = self._update_keypoint_pan_prior(
+            keypoints_xy,
+            confidences,
+            frame.shape[1],
+            frame_idx,
+        )
+
+        detected_this_update = np.array([_valid(keypoints_xy[i]) for i in range(self._kp_len)], dtype=bool)
+        for i in range(self._kp_len):
             if detected_this_update[i]:
                 self._keypoint_missing_counts[i] = 0
             else:
@@ -440,7 +1194,7 @@ class BasketballTrackingPipeline:
         ALPHA = 0.6
         carried_count = 0
         if self.last_good_keypoints is not None:
-            for i in range(18):
+            for i in range(self._kp_len):
                 has_det  = _valid(keypoints_xy[i])
                 has_hist = _valid(self.last_good_keypoints[i])
                 if has_det and has_hist:
@@ -453,21 +1207,35 @@ class BasketballTrackingPipeline:
                     keypoints_xy[i] = self.last_good_keypoints[i].copy()
                     carried_count += 1
 
-        for i in range(18):
+        for i in range(self._kp_len):
             if not _valid(keypoints_xy[i]):
                 keypoints_xy[i] = 0.0
                 confidences[i] = 0.0
 
         candidate_keypoints = keypoints_xy.copy()
         final_valid_count = int(((keypoints_xy > 0).all(axis=1)).sum())
-        candidate_H = compute_homography(candidate_keypoints)
+        candidate_H, candidate_mode, candidate_meta = self._select_homography_candidate(
+            candidate_keypoints,
+            observed_side,
+            frame.shape,
+            max_reproj,
+            use_stability=True,
+        )
         H = candidate_H
         h_status = "fail"
-        if H is not None and self._accept_homography_update(H, frame.shape, final_valid_count):
+        reseed_requested = self._force_homography_reseed
+        if H is not None and self._accept_homography_update(
+            H,
+            frame.shape,
+            final_valid_count,
+            candidate_meta,
+        ):
             self.homography_success_count += 1
             self.last_good_keypoints = candidate_keypoints.copy()
             self.last_H = H
-            if observed_side is not None:
+            self._last_H_mode = candidate_mode
+            self._force_homography_reseed = False
+            if observed_side in ("left", "right"):
                 self._court_side = observed_side
             h_status = "ok"
         else:
@@ -479,19 +1247,37 @@ class BasketballTrackingPipeline:
         if self.config.debug.keypoints:
             frame_label = "-" if frame_idx is None else str(frame_idx)
             src_label = "-" if src_idx is None else str(src_idx)
+            h_det = float(np.linalg.det(H)) if H is not None else 0.0
+            n_kp_used = int((candidate_keypoints > 0).all(axis=1).sum())
             print(
                 "    [kp-debug] "
                 f"frame={frame_label} src={src_label} "
+                f"backend={self.kp_backend} "
                 f"boxes={debug_boxes} instances={debug_instances} "
-                f"raw_valid={raw_valid_count}/18 "
+                f"raw_kp={debug_raw_keypoints} "
+                f"raw_valid={raw_valid_count}/{self._kp_len} "
                 f"conf>=0.1={raw_conf_01} conf>=0.5={raw_conf_05} "
-                f"final_valid={final_valid_count}/18 "
+                f"final_valid={final_valid_count}/{self._kp_len} "
                 f"carried={carried_count} "
                 f"side={observed_side or self._court_side or '-'} "
                 f"side_counts=(L{side_counts[0]},C{side_counts[1]},R{side_counts[2]}) "
+                f"layout={self._last_layout_side or '-'} "
+                f"layout_slope={self._last_layout_slope:.3f} "
+                f"layout_pairs={self._last_layout_pairs} "
                 f"side_switched={int(side_switched)} "
-                f"H={h_status}"
+                f"H={h_status} mode={candidate_mode or self._last_H_mode or '-'} "
+                f"cand_side={candidate_meta.get('side', '-')} "
+                f"score={float(candidate_meta.get('score', -1.0)):.1f} "
+                f"reproj={float(candidate_meta.get('reproj', -1.0)):.1f} "
+                f"shift=({float(candidate_meta.get('mean_shift', 0.0)):.1f},"
+                f"{float(candidate_meta.get('max_shift', 0.0)):.1f}) "
+                f"pan_dx={pan_dx:.2f} pan_conf={pan_conf:.2f} "
+                f"pan_match={pan_matches} pan_mad={pan_mad:.1f} "
+                f"reseed={int(reseed_requested)} det={h_det:.4f} kp_used={n_kp_used}"
             )
+
+        self._side_transition_frames = max(0, self._side_transition_frames - 1)
+        self._h_fallback_streak = 0 if h_status == "ok" else self._h_fallback_streak + 1
 
         return keypoints_xy, confidences, H
 
@@ -499,76 +1285,168 @@ class BasketballTrackingPipeline:
         self,
         keypoints_xy: np.ndarray,
         confidences: np.ndarray,
+        frame_width: int,
     ) -> Tuple[Optional[str], Tuple[int, int, int]]:
         valid = (keypoints_xy > 0).all(axis=1)
         confident = confidences >= self.config.keypoints.confidence
-        left_indices = set(self.config.keypoints.left_indices) | {8, 9}
-        center_indices = set(self.config.keypoints.center_indices)
-        right_indices = set(self.config.keypoints.right_indices) | {16, 17}
+        left_indices = set(self._kp_left_indices) | set(self._kp_left_inner_indices)
+        center_indices = set(self._kp_center_indices)
+        right_indices = set(self._kp_right_indices) | set(self._kp_right_inner_indices)
 
         left_count = sum(1 for idx in left_indices if idx < len(valid) and valid[idx] and confident[idx])
         center_count = sum(1 for idx in center_indices if idx < len(valid) and valid[idx] and confident[idx])
         right_count = sum(1 for idx in right_indices if idx < len(valid) and valid[idx] and confident[idx])
-        min_count = self.config.keypoints.side_switch_min_keypoints
-        center_min = self.config.keypoints.center_switch_min_keypoints
-        margin = self.config.keypoints.side_switch_margin
+        counts = (left_count, center_count, right_count)
 
+        layout_side, layout_slope, layout_pairs = self._layout_court_side(keypoints_xy, confidences)
+        self._last_layout_side = layout_side
+        self._last_layout_slope = layout_slope
+        self._last_layout_pairs = layout_pairs
+        if layout_side is not None:
+            return layout_side, counts
+
+        # Primary signal: position of center keypoints (half-court line) in camera frame
+        # If center line is in the left portion → camera shows right side of court (and vice versa)
+        center_xs = [
+            float(keypoints_xy[idx][0])
+            for idx in center_indices
+            if idx < len(valid) and valid[idx] and confident[idx]
+        ]
+        band = self.config.keypoints.center_side_band_ratio
+        if center_xs:
+            center_x = sum(center_xs) / len(center_xs)
+            self._last_center_kp_x = center_x
+            ratio = center_x / max(frame_width, 1)
+            if ratio < band:
+                return "right", counts
+            if ratio > (1.0 - band):
+                return "left", counts
+            return "center", counts
+
+        # Center disappeared — infer from last known position
+        if self._last_center_kp_x is not None:
+            ratio = self._last_center_kp_x / max(frame_width, 1)
+            return ("right" if ratio < 0.5 else "left"), counts
+
+        # No center signal ever — fall back to keypoint count
+        min_count = self.config.keypoints.side_switch_min_keypoints
+        margin = self.config.keypoints.side_switch_margin
         if right_count >= min_count and right_count >= left_count + margin:
-            return "right", (left_count, center_count, right_count)
+            return "right", counts
         if left_count >= min_count and left_count >= right_count + margin:
-            return "left", (left_count, center_count, right_count)
-        if center_count >= center_min:
-            return "center", (left_count, center_count, right_count)
-        return None, (left_count, center_count, right_count)
+            return "left", counts
+        return None, counts
+
+    def _layout_court_side(
+        self,
+        keypoints_xy: np.ndarray,
+        confidences: np.ndarray,
+    ) -> Tuple[Optional[str], float, int]:
+        kp_cfg = self.config.keypoints
+        min_conf = kp_cfg.side_layout_min_confidence
+        valid = (keypoints_xy > 0).all(axis=1) & (confidences >= min_conf)
+        vertical_groups = [
+            self._kp_left_indices,
+            self._kp_center_indices,
+            self._kp_left_inner_indices,
+            self._kp_right_indices,
+            self._kp_right_inner_indices,
+        ]
+
+        slopes: List[float] = []
+        for group in vertical_groups:
+            usable = [idx for idx in group if idx < len(valid) and valid[idx]]
+            if len(usable) < 2:
+                continue
+            pts = sorted((keypoints_xy[idx] for idx in usable), key=lambda p: float(p[1]))
+            for a_i in range(len(pts)):
+                for b_i in range(a_i + 1, len(pts)):
+                    p0, p1 = pts[a_i], pts[b_i]
+                    dy = float(p1[1] - p0[1])
+                    if abs(dy) < 18.0:
+                        continue
+                    dx = float(p1[0] - p0[0])
+                    slopes.append(dx / dy)
+
+        if len(slopes) < kp_cfg.side_layout_min_pairs:
+            return None, 0.0, len(slopes)
+
+        slope = float(np.median(slopes))
+        if abs(slope) < kp_cfg.side_layout_min_slope:
+            return None, slope, len(slopes)
+
+        # In image coordinates, "/" has negative dx/dy because x decreases as y goes down.
+        side = "left" if slope < 0 else "right"
+        return side, slope, len(slopes)
 
     def _accept_homography_update(
         self,
         H: np.ndarray,
         frame_shape: Tuple[int, int, int],
         valid_keypoints: int,
+        candidate_meta: Optional[Dict[str, float | str]] = None,
     ) -> bool:
+        # Basic sanity: finite values and non-degenerate matrix
+        if not np.isfinite(H).all() or abs(float(np.linalg.det(H))) < 1e-8:
+            return False
+
+        kp_cfg = self.config.keypoints
+        min_kp = kp_cfg.homography_min_update_keypoints
+
         if self.last_H is None:
+            # Cold start: require minimum keypoints but skip shift comparison
+            return valid_keypoints >= max(min_kp, kp_cfg.cold_start_min_keypoints)
+
+        if valid_keypoints < min_kp:
+            return False
+
+        reproj = float("inf")
+        if candidate_meta is not None:
+            try:
+                reproj = float(candidate_meta.get("reproj", float("inf")))
+            except (TypeError, ValueError):
+                reproj = float("inf")
+
+        if self._force_homography_reseed:
+            return (
+                valid_keypoints >= max(min_kp, kp_cfg.transition_min_keypoints)
+                and reproj <= kp_cfg.homography_recover_reproj_px
+            )
+
+        if (
+            valid_keypoints >= max(min_kp, kp_cfg.transition_min_keypoints)
+            and reproj <= kp_cfg.homography_good_reproj_px
+        ):
             return True
-        if valid_keypoints < self.config.keypoints.homography_min_update_keypoints:
-            return False
 
-        h, w = frame_shape[:2]
-        sample = np.array(
-            [
-                [0.0, 0.0],
-                [w * 0.5, 0.0],
-                [w - 1.0, 0.0],
-                [0.0, h * 0.5],
-                [w * 0.5, h * 0.5],
-                [w - 1.0, h * 0.5],
-                [0.0, h - 1.0],
-                [w * 0.5, h - 1.0],
-                [w - 1.0, h - 1.0],
-            ],
-            dtype=np.float32,
-        ).reshape(-1, 1, 2)
-        try:
-            prev = cv2.perspectiveTransform(sample, self.last_H).reshape(-1, 2)
-            cur = cv2.perspectiveTransform(sample, H).reshape(-1, 2)
-        except cv2.error:
-            return False
+        if (
+            self._h_fallback_streak >= kp_cfg.homography_recover_fallback_streak
+            and valid_keypoints >= min_kp
+            and reproj <= kp_cfg.homography_recover_reproj_px
+        ):
+            return True
 
-        if not np.isfinite(prev).all() or not np.isfinite(cur).all():
+        # During transition: stricter keypoint and shift thresholds
+        if self._side_transition_frames > 0:
+            if valid_keypoints < kp_cfg.transition_min_keypoints:
+                return False
+            s = kp_cfg.transition_strictness
+            max_mean = kp_cfg.homography_max_mean_shift * s
+            max_pt   = kp_cfg.homography_max_point_shift * s
+        else:
+            max_mean = kp_cfg.homography_max_mean_shift
+            max_pt   = kp_cfg.homography_max_point_shift
+
+        mean_shift, max_shift = self._homography_shift_stats(H, frame_shape)
+        if not np.isfinite(mean_shift) or not np.isfinite(max_shift):
             return False
-        shifts = np.linalg.norm(cur - prev, axis=1)
-        mean_shift = float(np.mean(shifts))
-        max_shift = float(np.max(shifts))
-        return (
-            mean_shift <= self.config.keypoints.homography_max_mean_shift
-            and max_shift <= self.config.keypoints.homography_max_point_shift
-        )
+        return mean_shift <= max_mean and max_shift <= max_pt
 
     # ── Court boundary filter ──────────────────────────────────────────────────
 
     def _is_valid_player_bbox(self, bbox: list, keypoints_xy: np.ndarray, frame_shape: Tuple) -> bool:
         if not any(kp[0] > 0 and kp[1] > 0 for kp in keypoints_xy):
             return True
-        INNER = {8, 9, 16, 17}
 
         def _vis(indices):
             return sorted(
@@ -581,21 +1459,21 @@ class BasketballTrackingPipeline:
         x1, y1, x2, y2 = [float(c) for c in bbox]
         cy = (y1 + y2) * 0.5
 
-        left_pts = _vis(self.config.keypoints.left_indices)
+        left_pts = _vis(self._kp_left_indices)
         if left_pts and x2 < _interp_x_at_y(left_pts, cy):
             return False
 
-        right_pts = _vis(self.config.keypoints.right_indices)
+        right_pts = _vis(self._kp_right_indices)
         if right_pts and x1 > _interp_x_at_y(right_pts, cy):
             return False
 
-        top_pts  = _vis(self.config.keypoints.top_indices)
-        edge_pts = _vis([i for i in range(18) if i not in INNER])
+        top_pts  = _vis(self._kp_top_indices)
+        edge_pts = _vis([i for i in range(len(keypoints_xy)) if i not in self._kp_inner_indices])
         ref_top  = top_pts or edge_pts
         if ref_top and y2 < min(p[1] for p in ref_top):
             return False
 
-        bottom_pts = _vis(self.config.keypoints.bottom_indices)
+        bottom_pts = _vis(self._kp_bottom_indices)
         if bottom_pts and y2 > max(p[1] for p in bottom_pts):
             return False
 
@@ -719,6 +1597,19 @@ class BasketballTrackingPipeline:
                 and inside_area >= self.config.detector.court_mask_min_area_px
             )
             bbox_overlap, bbox_inside = self._bbox_court_overlap(track["bbox"], H)
+            h_unreliable = (
+                H is None
+                or self._h_fallback_streak >= self.config.detector.h_fallback_unreliable_streak
+            )
+            mask_absent = mask is None or inside_area == 0
+            if mask_absent and h_unreliable:
+                if self.config.debug.suppression:
+                    print(
+                        f"    [court-mask-defer] frame={frame_idx} track={track_id} "
+                        f"reason=no_mask_and_stale_H streak={self._h_fallback_streak} "
+                        f"bbox={track['bbox']}"
+                    )
+                continue
             bbox_activates = bbox_overlap >= 0.40 and bbox_inside >= 2
             should_activate = mask_activates or bbox_activates
 
@@ -1154,6 +2045,7 @@ class BasketballTrackingPipeline:
                 continue
             event_frame = int(event.get("frame", frame_idx))
             self._relink_track_id(int(source_tid), int(new_tid), event_frame, "switch")
+            self._id_switch_count += 1
 
     def _apply_canonical_track_ids(self, tracks: List[Dict]) -> List[Dict]:
         canonical_tracks: List[Dict] = []
@@ -1393,58 +2285,145 @@ class BasketballTrackingPipeline:
         player_ids: List[int],
         player_feet: List[List[float]],
         H: Optional[np.ndarray],
+        keypoints_xy: Optional[np.ndarray] = None,
+        keypoint_confidences: Optional[np.ndarray] = None,
+        frame_idx: int = -1,
     ) -> None:
-        if H is None:
+        if H is None and keypoints_xy is None:
             return
 
         active_ids = set(player_ids)
+        cfg = self.config.visualization
+        alpha = cfg.tactical_smoothing
+        prior_age = frame_idx - self._tactical_pan_prior_frame if frame_idx >= 0 else 0
+        pan_prior_dx = self._tactical_pan_prior_dx
+        pan_prior_conf = self._tactical_pan_prior_conf
+        if (
+            not cfg.tactical_pan_prior_enabled
+            or prior_age > cfg.tactical_pan_prior_max_age_frames
+            or pan_prior_conf < cfg.tactical_pan_prior_min_conf
+        ):
+            pan_prior_dx = 0.0
+            pan_prior_conf = 0.0
+
         for track_id, foot_pt in zip(player_ids, player_feet):
-            try:
-                dst = cv2.perspectiveTransform(np.array([[foot_pt]], dtype=np.float32), H)
-                px = float(dst[0][0][0])
-                py = float(dst[0][0][1])
-            except cv2.error:
+            projected = self._project_player_to_tactical(foot_pt, H, keypoints_xy, keypoint_confidences)
+            if projected is None:
+                if self.config.debug.tactical:
+                    print(
+                        f"    [tactical-skip f={frame_idx} tid={track_id} "
+                        f"reason=no_projection]"
+                    )
                 continue
 
-            px = float(np.clip(px, 0, TACTICAL_WIDTH - 1))
-            py = float(np.clip(py, 0, TACTICAL_HEIGHT - 1))
+            px = float(projected["x"])
+            py = float(projected["y"])
+            raw_px = float(projected["raw_x"])
+            raw_py = float(projected["raw_y"])
+            source = str(projected["source"])
+            rel_count = int(projected["relative_keypoints"])
 
             previous = self._tactical_smoothed.get(track_id)
-            if previous is None:
+            last_seen = self._tactical_last_seen.get(track_id)
+            reset_gap = (
+                frame_idx >= 0
+                and last_seen is not None
+                and frame_idx - last_seen > cfg.tactical_reset_gap_frames
+            )
+            if previous is None or reset_gap:
                 smoothed = (px, py)
+                if reset_gap:
+                    self._tactical_history[track_id].clear()
             else:
-                max_step = self.config.visualization.tactical_max_step_px
                 dx = px - previous[0]
                 dy = py - previous[1]
-                step = float((dx * dx + dy * dy) ** 0.5)
+                step = float(np.hypot(dx, dy))
+
+                if abs(pan_prior_dx) >= 0.1:
+                    prior_weight = cfg.tactical_pan_prior_weight * pan_prior_conf
+                    predicted_x = float(np.clip(previous[0] + pan_prior_dx, 0, TACTICAL_WIDTH - 1))
+                    if abs(dx) >= 0.5 and dx * pan_prior_dx < 0:
+                        damp = cfg.tactical_pan_prior_opposite_damping
+                        px = float(np.clip(previous[0] + dx * damp + pan_prior_dx * (1.0 - damp), 0, TACTICAL_WIDTH - 1))
+                    elif prior_weight > 0:
+                        px = float(np.clip(px * (1.0 - prior_weight) + predicted_x * prior_weight, 0, TACTICAL_WIDTH - 1))
+
+                    dx = px - previous[0]
+                    dy = py - previous[1]
+                    step = float(np.hypot(dx, dy))
+
+                max_step = cfg.tactical_max_step_px
                 if max_step > 0 and step > max_step:
-                    scale = max_step / step
+                    scale = max_step / max(step, 1e-6)
                     px = previous[0] + dx * scale
                     py = previous[1] + dy * scale
-                alpha = self.config.visualization.tactical_smoothing
                 smoothed = (
                     previous[0] * alpha + px * (1.0 - alpha),
                     previous[1] * alpha + py * (1.0 - alpha),
                 )
+
             self._tactical_smoothed[track_id] = smoothed
+            self._tactical_last_seen[track_id] = frame_idx
             self._tactical_history[track_id].append(smoothed)
+
+            if self.config.debug.tactical:
+                print(
+                    f"    [tactical f={frame_idx} tid={track_id} "
+                    f"foot=({foot_pt[0]:.0f},{foot_pt[1]:.0f}) "
+                    f"raw=({raw_px:.1f},{raw_py:.1f}) "
+                    f"target=({px:.1f},{py:.1f}) "
+                    f"src={source} rel_kp={rel_count} "
+                    f"smooth=({smoothed[0]:.1f},{smoothed[1]:.1f}) "
+                    f"pan_prior=({pan_prior_dx:.2f},{pan_prior_conf:.2f})]"
+                )
 
         stale_ids = set(self._tactical_smoothed.keys()) - active_ids
         for track_id in stale_ids:
-            self._tactical_smoothed.pop(track_id, None)
+            last_seen = self._tactical_last_seen.get(track_id, frame_idx)
+            if frame_idx < 0 or frame_idx - last_seen > cfg.tactical_reset_gap_frames:
+                self._tactical_smoothed.pop(track_id, None)
+                self._tactical_last_seen.pop(track_id, None)
+                self._tactical_history.pop(track_id, None)
 
     @staticmethod
+    def _mask_foot_point(mask: np.ndarray) -> Optional[List[float]]:
+        if mask is None:
+            return None
+        mask = mask.astype(bool)
+        if not np.any(mask):
+            return None
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            return None
+        y_cut = float(np.percentile(ys, 88))
+        lower = ys >= y_cut
+        if np.count_nonzero(lower) < 4:
+            lower = ys >= max(float(ys.max()) - 3.0, 0.0)
+        foot_x = float(np.median(xs[lower]))
+        foot_y = float(np.percentile(ys[lower], 96))
+        return [foot_x, foot_y]
+
     def _tracks_to_feet(
-        tracks: List[Dict], jersey_bank
+        self,
+        tracks: List[Dict],
+        jersey_bank,
+        mask_by_id: Optional[Dict[int, np.ndarray]] = None,
     ) -> Tuple[List[int], List[List[float]], List[Optional[str]]]:
         ids, feet, jerseys = [], [], []
+        inset = self.config.visualization.tactical_foot_inset_px
         for t in tracks:
             if t["is_referee"]:
                 continue
             x1, y1, x2, y2 = t["bbox"]
-            ids.append(int(t["track_id"]))
-            feet.append([float((x1 + x2) / 2), float(y2)])
-            jerseys.append(jersey_bank.get_jersey(t["track_id"]))
+            track_id = int(t["track_id"])
+            ids.append(track_id)
+            mask_foot = self._mask_foot_point(mask_by_id.get(track_id)) if mask_by_id else None
+            if mask_foot is not None:
+                feet.append(mask_foot)
+            else:
+                foot_y = max(float(y1), float(y2) - inset)
+                feet.append([float((x1 + x2) / 2), foot_y])
+            jerseys.append(jersey_bank.get_jersey(track_id))
         return ids, feet, jerseys
 
     # ── Supervision annotation ─────────────────────────────────────────────────
@@ -1458,6 +2437,7 @@ class BasketballTrackingPipeline:
         H: Optional[np.ndarray],
         frame_idx: int,
         src_idx: int,
+        src_fps: float = 30.0,
     ) -> np.ndarray:
         result = frame.copy()
 
@@ -1488,21 +2468,46 @@ class BasketballTrackingPipeline:
             result   = self.ref_ellipse_annotator.annotate(scene=result, detections=r_dets)
             result   = self.ref_label_annotator.annotate(scene=result, detections=r_dets, labels=r_labels)
 
-        result = draw_keypoints_on_frame(result, kp_xy, kp_conf)
+        if self.config.visualization.draw_keypoints:
+            result = draw_keypoints_on_frame(
+                result,
+                kp_xy,
+                kp_conf,
+                min_confidence=self.config.keypoints.geometry_confidence,
+                draw_labels=False,
+            )
 
-        n_kp = int((kp_xy > 0).all(axis=1).sum())
-        cv2.putText(result, f"Frame: {frame_idx}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(result, f"Source: {src_idx}", (20, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-        cv2.putText(result, f"Tracks: {len(tracks)} | KP: {n_kp}/18", (20, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(result,
-                    f"Homography: {'OK' if H is not None else 'FAIL'}",
-                    (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                    (0, 255, 0) if H is not None else (0, 0, 255), 2)
-        cv2.putText(result, f"Jerseys: {len(self.jersey_bank.obj_to_jersey)}",
-                    (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        h_img, w_img = result.shape[:2]
+        font      = cv2.FONT_HERSHEY_DUPLEX
+        scale     = 0.52
+        thickness = 1
+        pad_x, pad_y = 14, 10
+        line_h    = 22
+
+        # Top-left stats panel
+        stats = [
+            f"FPS  {src_fps:.0f}",
+            f"Players  {len(player_tracks)}",
+            f"ID switches  {self._id_switch_count}",
+            f"Homography  {'OK' if H is not None else 'FAIL'}",
+        ]
+        panel_w = max(cv2.getTextSize(s, font, scale, thickness)[0][0] for s in stats) + pad_x * 2
+        panel_h = line_h * len(stats) + pad_y * 2
+        overlay = result.copy()
+        cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.45, result, 0.55, 0, result)
+        for i, text in enumerate(stats):
+            y = pad_y + (i + 1) * line_h
+            color = (255, 255, 255) if "FAIL" not in text else (80, 80, 255)
+            cv2.putText(result, text, (pad_x, y), font, scale, color, thickness, cv2.LINE_AA)
+
+        # Top-right github label
+        gh_text  = "github.com/hasan-bakr"
+        gh_scale = 0.42
+        (tw, th), _ = cv2.getTextSize(gh_text, font, gh_scale, thickness)
+        gx = w_img - tw - pad_x
+        gy = th + pad_y
+        cv2.putText(result, gh_text, (gx, gy), font, gh_scale, (200, 200, 200), thickness, cv2.LINE_AA)
 
         return result
 
@@ -1631,7 +2636,7 @@ class BasketballTrackingPipeline:
                 if frame_idx % self.config.jersey.update_interval == 0 and tracks:
                     self._detect_jerseys(frame, tracks, dets)
 
-                result  = self._annotate_frame(frame, tracks, kp_xy, kp_conf, H, frame_idx, src_idx)
+                result  = self._annotate_frame(frame, tracks, kp_xy, kp_conf, H, frame_idx, src_idx, src_fps)
 
                 if writer is None:
                     h, w = result.shape[:2]
@@ -1643,8 +2648,25 @@ class BasketballTrackingPipeline:
 
                 writer.write(result)
 
-                player_ids, player_feet, player_jerseys = self._tracks_to_feet(tracks, self.jersey_bank)
-                self._update_tactical_history(player_ids, player_feet, H)
+                tactical_mask_by_id: Dict[int, np.ndarray] = {}
+                tactical_player_tracks = [t for t in tracks if not t["is_referee"]]
+                if tactical_player_tracks and hasattr(self.tracker, "get_player_masks_for_tracks"):
+                    mask_tracks, masks = self.tracker.get_player_masks_for_tracks(
+                        tactical_player_tracks,
+                        frame.shape[:2],
+                    )
+                    if mask_tracks and masks is not None:
+                        tactical_mask_by_id = {
+                            int(track["track_id"]): mask.astype(bool)
+                            for track, mask in zip(mask_tracks, masks)
+                        }
+
+                player_ids, player_feet, player_jerseys = self._tracks_to_feet(
+                    tracks,
+                    self.jersey_bank,
+                    tactical_mask_by_id,
+                )
+                self._update_tactical_history(player_ids, player_feet, H, kp_xy, kp_conf, frame_idx)
                 tactical = draw_tactical_view(
                     self.court_img,
                     kp_xy,
@@ -1655,6 +2677,7 @@ class BasketballTrackingPipeline:
                     position_history=self._tactical_history,
                     point_radius=self.config.visualization.tactical_point_radius,
                     trail_thickness=self.config.visualization.tactical_trail_thickness,
+                    label_scale=self.config.visualization.tactical_label_scale,
                 )
                 tactical_writer.write(cv2.resize(tactical, (tactical_w, tactical_h)))
 
@@ -1673,7 +2696,7 @@ class BasketballTrackingPipeline:
 
                 n_kp = int((kp_xy > 0).all(axis=1).sum())
                 if self.config.debug.enabled and frame_idx % self.config.debug.progress_interval == 0:
-                    print(f"  frame {frame_idx:4d}  tracks={len(tracks):2d}  kp={n_kp}/18  jersey={len(self.jersey_bank.obj_to_jersey)}")
+                    print(f"  frame {frame_idx:4d}  tracks={len(tracks):2d}  kp={n_kp}/{self._kp_len}  jersey={len(self.jersey_bank.obj_to_jersey)}")
                     dbg = self.tracker.get_debug_summary()
                     p = dbg.get("player", {})
                     r = dbg.get("referee", {})

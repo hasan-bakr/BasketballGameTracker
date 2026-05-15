@@ -91,7 +91,7 @@ def main():
     parser.add_argument("--device",     default=None,               help="Compute device override (default: from config)")
     parser.add_argument("--log-file",   default=None,               help="Verbose log path (default: output_dir/LOG.log)")
     parser.add_argument("--confidence", type=float, default=None,   help="Detector confidence override (default: from config)")
-parser.add_argument("--debug",      action="store_true",        help="Enable tracking/mask/keypoint diagnostics")
+    parser.add_argument("--debug",      action="store_true",        help="Enable tracking/mask/keypoint diagnostics")
     parser.add_argument("--tracking-report-json", default=None,     help="Write lifecycle summary JSON to this path")
     args = parser.parse_args()
 
@@ -121,12 +121,6 @@ parser.add_argument("--debug",      action="store_true",        help="Enable tra
                     config.device = args.device
                 if args.confidence is not None:
                     config.detector.confidence = args.confidence
-                if args.detector_iou is not None:
-                    config.detector.iou_threshold = args.detector_iou
-                if args.track_thresh is not None:
-                    config.tracker.track_thresh = args.track_thresh
-                if args.new_track_thresh is not None:
-                    config.tracker.new_track_thresh = args.new_track_thresh
                 if args.debug:
                     config.debug.enabled = True
                     config.debug.tracking = True

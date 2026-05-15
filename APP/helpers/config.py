@@ -34,6 +34,7 @@ class DetectorConfig:
     activate_tracks_by_court_mask: bool = True
     court_mask_min_overlap: float = 0.12
     court_mask_min_area_px: int = 0
+    h_fallback_unreliable_streak: int = 3
 
 
 @dataclass
@@ -89,12 +90,17 @@ class JerseyConfig:
 
 @dataclass
 class KeypointConfig:
+    backend: str = "roboflow"
+    roboflow_model_id: str = "basketball-court-detection-2/19"
+    roboflow_confidence: float = 0.30
+    anchor_confidence: float = 0.10
+    keypoint_index_base: int = 0
     model_path: Optional[str] = DEFAULT_KEYPOINT_MODEL
-    court_image_path: Optional[str] = DEFAULT_COURT_IMAGE
-    confidence: float = 0.2
-    geometry_confidence: float = 0.25
+    court_image_path: Optional[str] = None
+    confidence: float = 0.05
+    geometry_confidence: float = 0.1
     update_interval: int = 2
-    border_margin: int = 30
+    border_margin: int = 10
     edge_band_ratio: float = 0.30
     still_px: float = 6.0
     still_frames: int = 45
@@ -104,7 +110,24 @@ class KeypointConfig:
     homography_max_point_shift: float = 80.0
     side_switch_min_keypoints: int = 3
     side_switch_margin: int = 2
+    side_layout_min_pairs: int = 1
+    side_layout_min_slope: float = 0.08
+    side_layout_min_confidence: float = 0.10
+    center_side_band_ratio: float = 0.4
     center_switch_min_keypoints: int = 1
+    side_switch_hysteresis_frames: int = 6
+    side_transition_frames: int = 8
+    cold_start_min_keypoints: int = 6
+    transition_min_keypoints: int = 7
+    transition_strictness: float = 0.5
+    compute_homography_max_reproj_px: float = 60.0
+    homography_good_reproj_px: float = 8.0
+    homography_recover_reproj_px: float = 14.0
+    homography_recover_fallback_streak: int = 2
+    homography_stability_weight: float = 0.35
+    homography_max_shift_weight: float = 0.05
+    homography_side_penalty: float = 80.0
+    homography_mode_switch_penalty: float = 25.0
     left_indices: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5])
     right_indices: List[int] = field(default_factory=lambda: [10, 11, 12, 13, 14, 15])
     center_indices: List[int] = field(default_factory=lambda: [6, 7])
@@ -114,25 +137,47 @@ class KeypointConfig:
 
 @dataclass
 class DebugConfig:
-    enabled: bool = False
-    tracking: bool = False
-    masks: bool = False
-    keypoints: bool = False
+    enabled: bool = True
+    tracking: bool = True
+    masks: bool = True
+    keypoints: bool = True
     progress_interval: int = 30
     id_jump_px: float = 90.0
     id_swap_px: float = 70.0
-    lifecycle: bool = False
-    suppression: bool = False
+    lifecycle: bool = True
+    suppression: bool = True
+    tactical: bool = True
 
 
 @dataclass
 class VisualizationConfig:
     trail_length: int = 0
     tactical_trail_length: int = 18
-    tactical_smoothing: float = 0.78
-    tactical_max_step_px: float = 25.0
-    tactical_point_radius: int = 4
+    tactical_smoothing: float = 0.45
+    tactical_max_step_px: float = 18.0
+    tactical_out_of_bounds_margin_px: float = 25.0
+    tactical_reset_gap_frames: int = 12
+    tactical_pan_prior_enabled: bool = False
+    tactical_pan_prior_min_keypoints: int = 4
+    tactical_pan_prior_min_image_px: float = 2.0
+    tactical_pan_prior_max_mad_px: float = 18.0
+    tactical_pan_prior_min_conf: float = 0.35
+    tactical_pan_prior_weight: float = 0.30
+    tactical_pan_prior_opposite_damping: float = 0.15
+    tactical_pan_prior_gain: float = 1.0
+    tactical_pan_prior_max_age_frames: int = 6
+    tactical_relative_projection: bool = True
+    tactical_relative_min_keypoints: int = 2
+    tactical_relative_nearest_keypoints: int = 6
+    tactical_relative_power: float = 1.35
+    tactical_relative_blend: float = 0.0
+    tactical_relative_outside_blend: float = 0.85
+    tactical_relative_conf_floor: float = 0.25
+    tactical_foot_inset_px: float = 3.0
+    tactical_point_radius: int = 7
     tactical_trail_thickness: int = 2
+    tactical_label_scale: float = 0.32
+    draw_keypoints: bool = False
     draw_masks: bool = True
     mask_alpha: float = 0.45
     mask_border_thickness: int = 4
